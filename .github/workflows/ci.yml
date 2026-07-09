@@ -1,0 +1,30 @@
+# CI for the PUBLIC forge repo. This file lives ONLY here — the monorepo sync
+# deliberately never touches .github (its token has no Workflows permission), so
+# edit it directly on this repo.
+#
+# Keeps the standalone workspace green on every push/PR: a --locked build (a
+# fresh clone must build against the committed Cargo.lock), fmt, clippy with
+# -D warnings, and the full test suite.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
