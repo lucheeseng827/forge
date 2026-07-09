@@ -1,0 +1,25 @@
+[package]
+name = "forge-worker"
+description = "forge Worker over a black-box OpenAI-compatible HTTP engine (vLLM/SGLang/llama.cpp). One persistent reqwest::Client + in-flight semaphore per base_url; backoff-with-full-jitter retry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+forge-core = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+governor = { workspace = true, optional = true }
+
+[features]
+# Off by default: the lean forge-cli musl binary must not compile governor. Enable
+# with `--features governor` (e.g. an embedder that sets WorkerSpec::rate_limit).
+default = []
+governor = ["dep:governor"]
+
+[dev-dependencies]
+wiremock = "0.6"

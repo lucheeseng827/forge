@@ -1,0 +1,6 @@
+{"custom_id":"req-001","method":"POST","url":"/v1/chat/completions","body":{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Summarize in one sentence: the quick brown fox jumps over the lazy dog."}]}}
+{"custom_id":"req-002","method":"POST","url":"/v1/chat/completions","body":{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Translate to French: good morning, how are you?"}]}}
+{"custom_id":"req-003","method":"POST","url":"/v1/chat/completions","body":{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"List three primary colors."}]}}
+{"custom_id":"req-004","method":"POST","url":"/v1/embeddings","body":{"model":"BAAI/bge-m3","input":"forge is a single-binary batch-inference work distributor."}}
+{"custom_id":"req-005","method":"POST","url":"/v1/chat/completions","body":{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Reply with a JSON object summarizing forge in one field."}]}}
+{"custom_id":"poison-1","method":"POST","url":"/v1/chat/completions","body":{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"FORCE_500 — this line demonstrates the retry-then-dead-letter path."}]}}

@@ -1,0 +1,19 @@
+[package]
+name = "forge-shard"
+description = "forge streaming JSONL ingest — parse each line into an Item keyed by custom_id, hydrate the queue, never hold the file in RAM. Byte-offset/line-range index for seek-resume."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+forge-core = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# In-memory queue to exercise the full streaming ingest → hydrate path in tests.
+forge-queue = { workspace = true }
+tempfile = "3"

@@ -1,0 +1,17 @@
+[package]
+name = "forge-core"
+description = "forge batch-inference coordinator — domain types, item state machine, the Queue/Worker/ResultStore traits, and the homogeneous fan-out loop (BatchRun). The brain; no I/O backend deps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+futures-util = { workspace = true }

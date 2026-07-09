@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "forge-core",
+    "forge-queue",
+    "forge-shard",
+    "forge-worker",
+    "forge-store",
+    "forge-cli",
+    "forge-spot",
+    "forge-proto",
+    "forge-agent",
+    "forge-batch",
+]
+
+# forge is its OWN standalone workspace with its own Cargo.lock — the member list
+# below is the complete, closed set of crates it ships. Build it standalone:
+# `cargo check --workspace`.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/nick-rust-project"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# intra-workspace
+forge-core = { path = "forge-core" }
+forge-queue = { path = "forge-queue" }
+forge-shard = { path = "forge-shard" }
+forge-worker = { path = "forge-worker" }
+forge-store = { path = "forge-store" }
+forge-spot = { path = "forge-spot" }
+forge-proto = { path = "forge-proto" }
+forge-batch = { path = "forge-batch" }
+
+# external — pinned conservatively; this workspace owns its own lock
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
+# rustls-tls so HTTPS OpenAI-compatible endpoints work (many are https://); rustls
+# keeps the eventual static-musl build viable (no system OpenSSL link).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+redb = "2"
+rand = "0.8"
+# GCRA rate limiter — OPTIONAL, pulled in only by forge-worker's off-by-default
+# `governor` feature so the lean default forge-cli musl binary never compiles it.
+# Pure Rust (no C/OpenSSL) → musl-clean even when enabled.
+governor = { version = "0.10", default-features = false, features = ["std"] }
+# Object-store result backend — OPTIONAL, behind forge-store's off-by-default
+# `object_store` feature; the cloud SDKs never reach the default forge-cli binary
+# (CI asserts their absence). NB: with the feature ON, the cloud transport pulls
+# reqwest 0.13 → rustls → aws-lc-rs (C, built via the cmake already required on CI);
+# a fully pure-`ring` static-musl `--features object_store` build is a follow-up
+# crypto-config item. The default static binary is unaffected (feature off).
+object_store = { version = "0.14", default-features = false, features = ["aws", "gcp", "azure", "fs"] }
+url = "2"
+bytes = "1"
+# Columnar Parquet output — OPTIONAL, behind forge-store's off-by-default `parquet`
+# feature. Pure-Rust: default-features=false + snap (Snappy) avoids the zstd/brotli C
+# codecs, so even a feature-on build stays musl-static. Pinned to 54.x (59 needs rustc
+# 1.85; the workspace MSRV is 1.80). arrow-array/arrow-schema MUST match parquet's
+# arrow-rs major.
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "54"
+arrow-schema = "54"
+
+# Single small static binary. panic=abort is safe here because this
+# is a leaf workspace; the test profile still unwinds.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

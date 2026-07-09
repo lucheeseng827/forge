@@ -1,0 +1,28 @@
+[package]
+name = "forge-store"
+description = "forge result sink keyed by custom_id — order-independent, idempotent writes, dedup-on-resume via emitted-id set, dead-letter JSONL. Local append-only file + an optional object_store (S3/GCS/Azure) backend behind the `object_store` feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+forge-core = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Object-store backend — all OPTIONAL, off by default so the lean forge-cli
+# musl binary never compiles the cloud SDKs (CI asserts their absence).
+object_store = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+
+[features]
+default = []
+object_store = ["dep:object_store", "dep:url", "dep:bytes", "dep:futures-util"]
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]

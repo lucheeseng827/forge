@@ -1,0 +1,47 @@
+[package]
+name = "forge-cli"
+description = "forge — the single static CLI binary. `forge run | resume | status | sweep`, a thin driver over forge-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { workspace = true }
+forge-queue = { workspace = true }
+forge-shard = { workspace = true }
+forge-worker = { workspace = true }
+forge-store = { workspace = true }
+# `forge serve-batch` — the OpenAI Batch REST front door over the engine.
+forge-batch = { workspace = true }
+clap = { workspace = true }
+# `signal` (for `serve-batch`'s Ctrl-C shutdown) on top of the workspace features;
+# additive and musl-friendly.
+tokio = { workspace = true, features = ["signal"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# All OFF for the shipped musl binary; CI asserts the default binary never pulls
+# arrow/parquet or the cloud SDKs.
+default = []
+# `forge export` (JSONL → Parquet) via forge-store's parquet backend.
+parquet = ["forge-store/parquet"]
+# `forge run --out s3://…` (and `resume`) writing results to S3/GCS/Azure via
+# forge-store's object_store backend.
+object_store = ["forge-store/object_store"]
+
+[dev-dependencies]
+forge-core = { workspace = true }
+wiremock = "0.6"
+# `process` (for the crash/kill integration test) on top of the workspace features;
+# additive, so it only affects test builds and adds no new locked crates.
+tokio = { workspace = true, features = ["process"] }

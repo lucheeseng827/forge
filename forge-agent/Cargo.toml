@@ -1,0 +1,45 @@
+[package]
+name = "forge-agent"
+description = "forge optional co-located drain agent — long-polls the single-writer coordinator for leases, runs them against the local engine, and runs the forge-spot watcher IN the VM so a spot/preempt notice stops new leases and drains in-flight within the worst-case ~30s window. Strictly spot-drain + health-probe + lease-proxy; never a task graph, never provisioning."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "forge_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forge-agent"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { workspace = true }
+forge-worker = { workspace = true }
+forge-spot = { workspace = true }
+forge-proto = { workspace = true }
+# The networked transport: reqwest is the agent-side client; tiny_http is the
+# coordinator-side server (deliberately minimal + musl-friendly — no async-server
+# framework stack). The core `forge` (forge-cli) musl binary is untouched.
+reqwest = { workspace = true }
+tiny_http = "0.12"
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Concrete backends for the `serve` binary subcommand (the coordinator side runs a
+# real queue + store); the `serve_coordinator` library fn stays generic over the
+# `forge-core` traits, so the lib itself does not force these on consumers.
+forge-queue = { workspace = true }
+forge-store = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+forge-queue = { workspace = true }
+forge-store = { workspace = true }

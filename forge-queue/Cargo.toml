@@ -1,0 +1,21 @@
+[package]
+name = "forge-queue"
+description = "forge durable embedded lease queue — single-writer, visibility-timeout, expired-lease reaper, dead-letter. rusqlite-WAL primary; redb behind a feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+redb = ["dep:redb"]
+
+[dependencies]
+forge-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }

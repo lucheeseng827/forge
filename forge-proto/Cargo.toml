@@ -1,0 +1,12 @@
+[package]
+name = "forge-proto"
+description = "forge coordinator<->agent wire contract — deliberately small: lease-pull, result-post, interruption-notice. NO task-graph types (the dagron boundary); just the three messages an optional co-located drain agent exchanges with the single-writer coordinator."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

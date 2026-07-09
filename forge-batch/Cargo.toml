@@ -1,0 +1,34 @@
+[package]
+name = "forge-batch"
+description = "forge-batch — a real OpenAI Batch REST API (`/v1/files`, `/v1/batches`) front door over the forge engine. Point unmodified OpenAI SDK code at it and a giant JSONL fans across the configured worker fleet. A REST skin over the EXISTING engine — no task graph, no DAG."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "forge_batch"
+path = "src/lib.rs"
+
+[dependencies]
+forge-core = { workspace = true }
+forge-queue = { workspace = true }
+forge-shard = { workspace = true }
+forge-worker = { workspace = true }
+forge-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+# The same deliberately-minimal, musl-friendly server the OSS coordinator + ee intake
+# use (forge-agent's tiny_http) — no async web framework enters the tree. One HTTP
+# stack across the whole system.
+tiny_http = "0.12"
+
+[dev-dependencies]
+# Drive the batch server over a real ephemeral socket in the integration test — the
+# same reqwest the OSS agent transport already pulls into the graph (dev-only).
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
