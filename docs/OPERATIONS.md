@@ -2,8 +2,8 @@
 
 How to deploy, back up, upgrade, monitor, and debug a forge run. Grounded in the
 code as built; configuration details live in [CONFIG.md](./CONFIG.md), endpoint
-details in [API.md](./API.md), the design overview in the
-[README](../README.md).
+details in [API.md](./API.md), the architecture + event flow in
+[DESIGN.md](./DESIGN.md).
 
 ## Deploy
 

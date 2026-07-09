@@ -66,7 +66,9 @@ input_ids=6 emitted_ids=6 missing=0 extra=0 duplicate_input=0 rejected_input=0
 complete: every input id has a terminal result ✅
 ```
 
-Reference docs: **[`docs/CONFIG.md`](./docs/CONFIG.md)** (every flag/env/feature in
+Reference docs: **[`docs/DESIGN.md`](./docs/DESIGN.md)** (architecture, the
+end-to-end event flow, delivery semantics, and what this design offers that
+alternatives don't) · **[`docs/CONFIG.md`](./docs/CONFIG.md)** (every flag/env/feature in
 one table) · **[`docs/API.md`](./docs/API.md)** (the engine wire contract, the
 coordinator HTTP protocol, the library entry points) ·
 **[`docs/OPERATIONS.md`](./docs/OPERATIONS.md)** (deploy, backup, monitoring,
@@ -178,6 +180,7 @@ idempotent result writes keyed by `custom_id` (**exactly-once *effect***, not
 exactly-once execution), and a "checkpoint" that is simply the queue state +
 input byte-offset index + result manifest. A fresh coordinator reopens the file,
 expires stale leases, skips already-emitted `custom_id`s, and continues. See
+[`docs/DESIGN.md`](./docs/DESIGN.md) for the full component map + event flow, and
 [`./BENCHMARKS.md`](./BENCHMARKS.md) for the measured **kill-9 → resume →
 zero-loss** proof (300-item batch, killed mid-flight, every id done exactly once,
 no input⨝output join). `forge audit --checkpoint <db>` reports what a `resume`
