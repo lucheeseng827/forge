@@ -1,12 +1,10 @@
 # forge chart values.
-#
-# There is no published forge image (yet): build one from the repo-root
-# Dockerfile and push it to your registry, then set image.repository. The chart
-# refuses to render without it — a silent default pointing at a registry we
-# don't control would be worse.
 
 image:
-  repository: ""            # REQUIRED, e.g. ghcr.io/you/forge
+  # Official multi-arch image (linux/amd64 + linux/arm64), built from the
+  # repo-root Dockerfile. Override with your own registry if you build from
+  # source.
+  repository: docker.io/mancube/forge
   tag: "v0.1.0"
   pullPolicy: IfNotPresent
 

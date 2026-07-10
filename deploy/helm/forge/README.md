@@ -14,17 +14,16 @@ Two shapes, independently toggleable:
 ## Quick start
 
 ```sh
-# 1. Build + push the image (repo-root Dockerfile, FROM scratch, ~4 MB binary):
-docker build -t <registry>/forge:v0.1.0 .
-docker push <registry>/forge:v0.1.0
-
-# 2. Install:
 helm install forge deploy/helm/forge \
-  --set image.repository=<registry>/forge \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000,http://vllm-1.engines.svc:8000}' \
   --set serveBatch.concurrency=256 \
   --set serveBatch.apiKey=<bearer key>
 ```
+
+The default image is the official multi-arch `docker.io/mancube/forge`
+(linux/amd64 + linux/arm64, ~5 MB, FROM scratch). Building your own instead:
+`docker build -t <registry>/forge:v0.1.0 .` from the repo root, push it, and
+set `image.repository`.
 
 Then any OpenAI SDK pointed at `http://<service>:8080/v1` runs its batch flow
 (`files.create` → `batches.create` → poll → `files.content`) against your own
@@ -34,7 +33,6 @@ engines, with live per-item progress and mid-run partial results.
 
 ```sh
 helm install nightly deploy/helm/forge \
-  --set image.repository=<registry>/forge \
   --set serveBatch.enabled=false \
   --set runJob.enabled=true \
   --set 'runJob.workers={http://vllm-0.engines.svc:8000}' \
