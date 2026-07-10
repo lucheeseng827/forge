@@ -1,8 +1,9 @@
 # forge — batch-inference coordinator
 
-Fan a giant JSONL of prompts across N OpenAI-compatible engines (vLLM / SGLang /
-llama.cpp), survive kills and spot interruptions, and prove completeness — as a
-single static binary. This image **is** that binary: FROM scratch, ~5 MB, no
+Fan a giant JSONL of prompts across N workers — any OpenAI-compatible engine
+(vLLM / SGLang / llama.cpp / Ollama / …) or hosted provider endpoint
+(OpenAI-compatible or Anthropic-Messages-compatible) — survive kills and spot
+interruptions, and prove completeness, as a single static binary. This image **is** that binary: FROM scratch, ~5 MB, no
 shell, no libc, nonroot. forge is the orchestration shell only — it never runs
 inference and never provisions instances; your engines stay where they are.
 
@@ -12,8 +13,8 @@ Source, docs, benchmarks: <https://github.com/lucheeseng827/forge> (Apache-2.0)
 
 | Tag | What |
 |---|---|
-| `latest`, `v0.1.1` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
-| `v0.1.1-amd64`, `v0.1.1-arm64` (and prior versions) | pinned single-arch |
+| `latest`, `v0.1.2` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
+| `v0.1.2-amd64`, `v0.1.2-arm64` (and prior versions) | pinned single-arch |
 
 ## Quick start — run a batch
 
@@ -21,7 +22,7 @@ Source, docs, benchmarks: <https://github.com/lucheeseng827/forge> (Apache-2.0)
 # input.jsonl: one OpenAI Batch-format request per line, keyed by custom_id
 docker run --rm --network host \
   -v "$PWD:/work" -w /work \
-  mancube/forge:v0.1.1 \
+  mancube/forge:v0.1.2 \
   run --input input.jsonl \
       --workers http://gpu1:8000,http://gpu2:8000 \
       --engine vllm --concurrency 256 \
@@ -33,7 +34,7 @@ Kill it mid-run (or lose the box) and run the same command again — it
 re-run, and `verify` proves every input id reached a terminal result.
 
 ```sh
-docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.1 \
+docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.2 \
   status --checkpoint state.db          # counts, success rate, failure mix
 docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.1 \
   verify --input input.jsonl --results results.jsonl
@@ -62,7 +63,7 @@ the unauthenticated liveness route; everything else requires the bearer key.
 The chart is published as an OCI artifact right beside this image:
 
 ```sh
-helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.1 \
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.2 \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
   --set 'serveBatch.apiKey=<bearer key>'
 ```

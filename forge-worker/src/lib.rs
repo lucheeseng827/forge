@@ -312,8 +312,34 @@ impl HttpWorker {
 
     /// Build a worker from its spec: a keep-alive HTTP client and an in-flight
     /// semaphore sized to the declared concurrency.
+    ///
+    /// **Worker auth (env-only, never a flag, never logged):** self-hosted engines
+    /// stay credential-free — forge sends no auth headers by default. Set
+    /// `FORGE_WORKER_API_KEY` to drive a hosted endpoint: the OpenAI-compatible
+    /// hints send it as `Authorization: Bearer`, the Anthropic hint as `x-api-key`
+    /// plus the required `anthropic-version` header.
     pub fn new(spec: WorkerSpec) -> Result<Self, ForgeError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(key) = std::env::var("FORGE_WORKER_API_KEY") {
+            if !key.is_empty() && spec.engine_hint.is_hosted() {
+                use reqwest::header::{HeaderName, HeaderValue};
+                let mut put = |name: &'static str, value: String| -> Result<(), ForgeError> {
+                    let mut v = HeaderValue::from_str(&value)
+                        .map_err(|e| ForgeError::Worker(format!("bad worker api key: {e}")))?;
+                    v.set_sensitive(true); // keep it out of debug/log output
+                    headers.insert(HeaderName::from_static(name), v);
+                    Ok(())
+                };
+                if spec.engine_hint == forge_core::EngineHint::AnthropicApi {
+                    put("x-api-key", key)?;
+                    put("anthropic-version", "2023-06-01".to_string())?;
+                } else {
+                    put("authorization", format!("Bearer {key}"))?;
+                }
+            }
+        }
         let client = reqwest::Client::builder()
+            .default_headers(headers)
             .pool_max_idle_per_host(spec.concurrency_limit.max(1))
             // Bound stalls: a dead/hung engine must not pin a semaphore permit
             // forever. `connect_timeout` is tight; the overall request timeout is
@@ -404,7 +430,7 @@ fn parse_load(hint: EngineHint, body: &str) -> Option<u32> {
         EngineHint::Sglang => {
             parse_sglang_waiting(&serde_json::from_str::<serde_json::Value>(body).ok()?)
         }
-        EngineHint::Router => None,
+        EngineHint::Router | EngineHint::OpenAiApi | EngineHint::AnthropicApi => None,
     }
 }
 
@@ -496,6 +522,13 @@ impl Worker for HttpWorker {
     }
 
     async fn probe(&self) -> bool {
+        // Hosted provider APIs expose no health route: assume ready and let real
+        // responses (429s/errors → AIMD + cooldown) drive behavior instead.
+        if self.spec.engine_hint.is_hosted() {
+            self.ready.store(true, Ordering::Relaxed);
+            self.load.store(LOAD_UNKNOWN, Ordering::Relaxed);
+            return true;
+        }
         let url = format!(
             "{}{}",
             self.spec.base_url.trim_end_matches('/'),
@@ -586,10 +619,17 @@ impl Worker for HttpWorker {
                         } else {
                             // AIMD: a clean 2xx is the "increase" signal.
                             self.inflight.record(true);
-                            // `usage` is captured free from every OpenAI-compatible body.
+                            // `usage` is captured free from every response body —
+                            // parsed per the *item's* endpoint shape, so Anthropic
+                            // Messages tokens price identically in `forge cost`.
                             let usage = body
                                 .get("usage")
-                                .map(forge_core::TokenUsage::from_openai_usage)
+                                .map(|u| match kind {
+                                    EndpointKind::Messages => {
+                                        forge_core::TokenUsage::from_anthropic_usage(u)
+                                    }
+                                    _ => forge_core::TokenUsage::from_openai_usage(u),
+                                })
                                 .unwrap_or_default();
                             return Ok(ItemResult {
                                 custom_id: item.custom_id.clone(),
@@ -699,6 +739,90 @@ mod tests {
         assert!(r.is_success());
         assert_eq!(r.usage.total_tokens, 15);
         assert_eq!(r.response.unwrap().status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_item_drives_a_messages_endpoint() {
+        // An item in the Anthropic Messages shape (as `forge import` emits for an
+        // Anthropic batch file) hits /v1/messages verbatim; the response's
+        // content/usage shapes are parsed natively into the common types.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{"type": "text", "text": "hello"}],
+                "usage": {"input_tokens": 320, "output_tokens": 48,
+                          "cache_read_input_tokens": 100}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut it = item();
+        it.url = "/v1/messages".into();
+        it.body = json!({"model": "m", "max_tokens": 64,
+                         "messages": [{"role": "user", "content": "hi"}]});
+        let w = HttpWorker::new(
+            WorkerSpec::new("w0", server.uri(), EndpointKind::Chat)
+                .engine_hint(forge_core::EngineHint::AnthropicApi),
+        )
+        .unwrap()
+        .with_validation(forge_core::ResponseCheck::NonEmpty);
+        let r = w.submit(&it).await.unwrap();
+        assert!(r.is_success());
+        // prompt_tokens folds in the cache-read bucket (320 input + 100 cache-read).
+        assert_eq!(r.usage.prompt_tokens, 420);
+        assert_eq!(r.usage.total_tokens, 468); // derived
+        assert_eq!(r.usage.cached_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn hosted_hint_skips_probe_and_assumes_ready() {
+        // No /health route anywhere — a hosted-hint worker must still probe true.
+        let server = MockServer::start().await;
+        let w = HttpWorker::new(
+            WorkerSpec::new("w0", server.uri(), EndpointKind::Chat)
+                .engine_hint(forge_core::EngineHint::OpenAiApi),
+        )
+        .unwrap();
+        w.set_ready(false);
+        assert!(w.probe().await);
+        assert!(w.is_ready());
+    }
+
+    #[tokio::test]
+    async fn self_hosted_hint_never_sends_the_worker_api_key() {
+        // FORGE_WORKER_API_KEY is process-global, not per-worker. A self-hosted hint
+        // (Vllm/Sglang/LlamaCpp/Router) must never attach it, even when it happens to
+        // be set for a sibling hosted worker in the same process — the "self-hosted
+        // engines stay credential-free" guarantee must hold regardless of env state.
+        std::env::set_var("FORGE_WORKER_API_KEY", "super-secret");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let w = HttpWorker::new(
+            WorkerSpec::new("w0", server.uri(), EndpointKind::Chat)
+                .engine_hint(forge_core::EngineHint::Vllm),
+        )
+        .unwrap();
+        let r = w.submit(&item()).await.unwrap();
+        assert!(r.is_success());
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(
+            !received[0].headers.contains_key("authorization"),
+            "self-hosted worker must never send the hosted-provider api key"
+        );
+        std::env::remove_var("FORGE_WORKER_API_KEY");
     }
 
     #[tokio::test]

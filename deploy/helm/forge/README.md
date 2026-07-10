@@ -15,7 +15,7 @@ Two shapes, independently toggleable:
 
 ```sh
 # from the OCI registry (no checkout needed):
-helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.1 \
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.2 \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
   --set 'serveBatch.apiKey=<key>'
 

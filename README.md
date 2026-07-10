@@ -1,7 +1,9 @@
 # forge
 
 **forge** is a single-binary, self-hosted coordinator that fans a giant JSONL of
-prompts/docs across N (spot) GPUs running **vLLM / SGLang / llama.cpp**, survives
+prompts/docs across N workers — **any OpenAI-compatible engine** (vLLM, SGLang,
+llama.cpp, Ollama, …) on your own (spot) GPUs, **or hosted provider APIs**
+(OpenAI-compatible and Anthropic-Messages-compatible endpoints alike) — survives
 interruptions, and aggregates results cheaply. It is a **narrow batch-inference
 work distributor** — explicitly **NOT** a workflow/DAG scheduler.
 
@@ -21,9 +23,14 @@ shell.
 
 ## Quickstart
 
-forge is BYO-endpoints: you already have one or more OpenAI-compatible engines
-running (vLLM `--max-num-seqs`, SGLang `--max-running-requests`, or
-llama-server `--parallel`). Point forge at them and drop a JSONL.
+forge is BYO-endpoints: point it at whatever serves your model — one or more
+self-hosted OpenAI-compatible engines (vLLM `--max-num-seqs`, SGLang
+`--max-running-requests`, llama-server `--parallel`, Ollama, a router…) — and
+drop a JSONL. Hosted provider endpoints work too: set `--engine openai-api` or
+`--engine anthropic-api` and export `FORGE_WORKER_API_KEY` (env-only, never
+logged); items in the Anthropic Messages shape (`url: /v1/messages`, e.g.
+straight out of `forge import`) drive an Anthropic-compatible API natively,
+with usage metered into the same cost ledger.
 
 ```sh
 forge run \

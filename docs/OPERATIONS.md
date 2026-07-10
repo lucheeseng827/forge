@@ -254,10 +254,12 @@ one writer; take backups with `sqlite3 .backup` rather than copying a live db.
 What listens, what authenticates, what is deliberately out of scope. Distinct from
 a disclosure policy.
 
-- **The `forge` CLI listens on nothing.** It makes outbound HTTP(S) to your engine
-  URLs only. It sends **no credentials** — there is no API-key flag or env; engines
-  must be reachable without auth (private network/VPC, SSH tunnel, or a
-  reverse-proxy that injects auth — put secrets in the proxy, not in prompts).
+- **The `forge` CLI listens on nothing.** It makes outbound HTTP(S) to your worker
+  URLs only. By default it sends **no credentials** — self-hosted engines are
+  reachable without auth (private network/VPC, SSH tunnel, or a reverse-proxy that
+  injects auth). Driving a **hosted** provider endpoint is the one opt-in exception:
+  `FORGE_WORKER_API_KEY` (env-only, never a flag, never logged) is sent in the
+  provider's own header style per the `--engine` hint.
 - **`forge-agent serve` is an unauthenticated JSON-over-HTTP listener**, bound to
   `127.0.0.1:8080` by default. Anyone who can reach it can pull prompts (data
   exfiltration) and post results (forgery — fenced by lease generation against

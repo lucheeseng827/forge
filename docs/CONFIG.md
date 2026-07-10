@@ -23,9 +23,11 @@ those change.
 | `RUST_LOG` | tracing `EnvFilter` | `info` | Log level/filter for both `forge` and `forge-agent` (e.g. `RUST_LOG=forge_core=debug`). | Debugging dispatch/lease behavior. |
 | `AWS_*` / `GOOGLE_*` / `AZURE_*` | strings | — | **`--features object_store` builds only**, and only when `--out`/`--results` is a cloud URL: every env var with one of these three prefixes is forwarded to the object_store builders (its `from_env` conventions — credentials, region, endpoint). `file://`/`memory://` URLs get none forwarded. Source: `env_opts`/`scheme_env_opts` in `forge-store/src/object_store_backend.rs`. | Pointing `--out` at S3/GCS/Azure. |
 
+| `FORGE_WORKER_API_KEY` | string | — | Optional bearer/API key for **hosted** worker endpoints (`--engine openai-api` → `Authorization: Bearer`; `--engine anthropic-api` → `x-api-key` + `anthropic-version`). Env-only by design — never a flag, never logged. Unset (the default) sends no auth headers at all. | Driving a hosted provider API instead of (or alongside) self-hosted engines. |
+
 That is the whole list — the default binary deliberately reads no env var but
-`RUST_LOG` (no hidden credentials: it sends **no** auth headers to workers, see
-[OPERATIONS §security](./OPERATIONS.md#security-posture)).
+`RUST_LOG` and (opt-in) `FORGE_WORKER_API_KEY`; with the key unset it sends **no**
+auth headers to workers (see [OPERATIONS §security](./OPERATIONS.md#security-posture)).
 
 ## `forge` CLI
 
@@ -39,8 +41,8 @@ Source: `struct WorkerArgs`.
 | flag | type | default | what it does | when to change |
 |---|---|---|---|---|
 | `--workers` | comma-separated URLs | **required** | The BYO OpenAI-compatible base URLs to fan out across. Workers are named `w0`, `w1`, … in URL order. | Always set. |
-| `--engine` | `vllm` \| `sglang` \| `llamacpp` \| `router` | `vllm` | Engine hint — affects only the load-metric endpoint read during health probes (vLLM `/metrics`, SGLang `/get_server_info`, llama.cpp `/slots`; `router` reads none). The wire contract is OpenAI-compatible regardless. | Match your engine so load-aware dispatch has a metric; use `router` for a self-balancing front. |
-| `--endpoint` | `chat` \| `completions` \| `embeddings` | `chat` | Default endpoint for items whose `url` is empty; also the fallback kind for `--require` validation. Items with their own `url` override it per line. | Embedding or legacy-completions batches. |
+| `--engine` | `vllm` \| `sglang` \| `llamacpp` \| `router` \| `openai-api` \| `anthropic-api` | `vllm` | Engine hint — affects the health-probe/load-metric shape and (for the two hosted hints) the auth-header style, never the per-item wire contract. Self-hosted hints read a queue-depth metric (vLLM `/metrics`, SGLang `/get_server_info`, llama.cpp `/slots`; `router` reads none); hosted hints skip the probe (no `/health` route to ask) and authenticate with `FORGE_WORKER_API_KEY`. | Match your engine so load-aware dispatch has a metric; `router` for a self-balancing front; the `*-api` hints for hosted provider endpoints. |
+| `--endpoint` | `chat` \| `completions` \| `embeddings` \| `messages` | `chat` | Default endpoint for items whose `url` is empty; also the fallback kind for `--require` validation. Items with their own `url` override it per line (`/v1/messages` items validate + meter in the Anthropic Messages shape). | Embedding, legacy-completions, or Anthropic-Messages batches. |
 | `--concurrency` | usize | `256` (`resume`: the recorded value) | Per-worker in-flight cap = the **ceiling** of the AIMD adaptive limiter. Set it to the engine's own knob (vLLM `--max-num-seqs`, SGLang `--max-running-requests`, llama-server `--parallel`). `run` records it in the checkpoint; a bare `resume` reuses the recorded value (an explicit flag overrides, with a warning on divergence), so a resume can never silently restart AIMD at a ceiling the fleet was not configured for. | Always match the engine; too high risks engine OOM (AIMD backs off but starts at the ceiling). |
 | `--lease-secs` | u64 (seconds) | `300` | Visibility-timeout **floor**: how long a leased item stays invisible before the reaper re-queues it. | Lower for fast items (quicker crash recovery); raise if items legitimately run long. |
 | `--lease-max-secs` | u64 (seconds) | `1800` | **Cap** on the adaptive lease TTL. The effective TTL grows from `--lease-secs` toward this as the run observes real item latency (2× peak observed latency, clamped). Values below `--lease-secs` are treated as `--lease-secs`. | Bound how long a dead worker's items stay stuck leased. |

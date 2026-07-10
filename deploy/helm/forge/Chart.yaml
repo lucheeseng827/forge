@@ -7,7 +7,7 @@ description: >-
   resumes instead of restarting. Engines (vLLM / SGLang / llama.cpp) are BYO
   endpoints; this chart deliberately deploys none.
 type: application
-version: 0.1.1
-appVersion: "0.1.1"
+version: 0.1.2
+appVersion: "0.1.2"
 keywords: [llm, batch-inference, openai-batch]
 sources: [https://github.com/lucheeseng827/forge]

@@ -44,7 +44,7 @@ impl ResponseCheck {
             ResponseCheck::Any => Ok(()),
             ResponseCheck::NonEmpty => match kind {
                 EndpointKind::Embeddings => check_embedding(body),
-                EndpointKind::Chat | EndpointKind::Completions => {
+                EndpointKind::Chat | EndpointKind::Completions | EndpointKind::Messages => {
                     let text = primary_text(kind, body)?;
                     if text.trim().is_empty() {
                         Err("empty output content".into())
@@ -55,7 +55,7 @@ impl ResponseCheck {
             },
             ResponseCheck::Json => match kind {
                 EndpointKind::Embeddings => check_embedding(body),
-                EndpointKind::Chat | EndpointKind::Completions => {
+                EndpointKind::Chat | EndpointKind::Completions | EndpointKind::Messages => {
                     let text = primary_text(kind, body)?;
                     if text.trim().is_empty() {
                         return Err("empty output content".into());
@@ -71,6 +71,16 @@ impl ResponseCheck {
 
 /// The model's primary output text for a chat/completions response.
 fn primary_text(kind: EndpointKind, body: &Value) -> Result<&str, String> {
+    // Anthropic Messages puts the output at `content[0].text`, not under `choices`.
+    if kind == EndpointKind::Messages {
+        return body
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("text"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "response has no content text".to_string());
+    }
     let choice = body
         .get("choices")
         .and_then(|c| c.as_array())
@@ -79,7 +89,7 @@ fn primary_text(kind: EndpointKind, body: &Value) -> Result<&str, String> {
     let text = match kind {
         EndpointKind::Chat => choice.get("message").and_then(|m| m.get("content")),
         EndpointKind::Completions => choice.get("text"),
-        EndpointKind::Embeddings => None,
+        EndpointKind::Embeddings | EndpointKind::Messages => None,
     };
     text.and_then(|v| v.as_str())
         .ok_or_else(|| "response choice has no text content".to_string())
@@ -127,6 +137,26 @@ mod tests {
         assert!(c.validate(EndpointKind::Chat, &chat(json!("   "))).is_err());
         assert!(c.validate(EndpointKind::Chat, &chat(json!(""))).is_err());
         assert!(c.validate(EndpointKind::Chat, &json!({})).is_err()); // no choices
+    }
+
+    #[test]
+    fn messages_shape_is_validated_natively() {
+        // Anthropic Messages: output at content[0].text, no `choices` envelope.
+        let ok = json!({"content": [{"type": "text", "text": "hello"}]});
+        let empty = json!({"content": [{"type": "text", "text": "  "}]});
+        let jsonish = json!({"content": [{"type": "text", "text": "{\"a\":1}"}]});
+        assert!(ResponseCheck::NonEmpty
+            .validate(EndpointKind::Messages, &ok)
+            .is_ok());
+        assert!(ResponseCheck::NonEmpty
+            .validate(EndpointKind::Messages, &empty)
+            .is_err());
+        assert!(ResponseCheck::Json
+            .validate(EndpointKind::Messages, &jsonish)
+            .is_ok());
+        assert!(ResponseCheck::Json
+            .validate(EndpointKind::Messages, &ok)
+            .is_err());
     }
 
     #[test]

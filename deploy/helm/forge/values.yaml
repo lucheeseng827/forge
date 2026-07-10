@@ -5,7 +5,7 @@ image:
   # repo-root Dockerfile. Override with your own registry if you build from
   # source.
   repository: docker.io/mancube/forge
-  tag: "v0.1.1"
+  tag: "v0.1.2"
   pullPolicy: IfNotPresent
 
 # ── serve-batch: the long-running OpenAI Batch REST front door ────────────────

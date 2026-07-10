@@ -11,19 +11,32 @@ forge has three API surfaces:
 Source: `HttpWorker::submit`/`probe` in [`forge-worker/src/lib.rs`](../forge-worker/src/lib.rs).
 
 For each item, forge issues `POST {worker_base_url}{item.url}` (the item's `url`, or
-the run's `--endpoint` default: `/v1/chat/completions`, `/v1/completions`, or
-`/v1/embeddings`) with the item's `body` passed through **verbatim** as JSON.
+the run's `--endpoint` default: `/v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, or `/v1/messages`) with the item's `body` passed through
+**verbatim** as JSON. The contract is provider-neutral: anything speaking the
+OpenAI-compatible surface works unmodified, and the Anthropic-native Messages
+shape is supported alongside it.
 
-- **No auth headers are added.** forge sends no `Authorization`/API key to workers —
-  BYO endpoints are assumed network-protected (see
-  [OPERATIONS §security](./OPERATIONS.md#security-posture)).
+| Worker | `--engine` hint | Auth | Notes |
+|---|---|---|---|
+| Self-hosted OpenAI-compatible engine (vLLM, SGLang, llama.cpp, Ollama, routers, …) | `vllm` / `sglang` / `llamacpp` / `router` | none (network-protected) | health probe + load-aware dispatch per the hint |
+| Hosted OpenAI-compatible API | `openai-api` | `FORGE_WORKER_API_KEY` → `Authorization: Bearer` | probe skipped (assumed ready); rate limits learned from response headers |
+| Hosted Anthropic-compatible Messages API | `anthropic-api` | `FORGE_WORKER_API_KEY` → `x-api-key` + `anthropic-version` | items carry the Messages body (`url: /v1/messages`); usage (`input_tokens`/`output_tokens`, `cache_read_input_tokens`) maps into the common token accounting |
+
+- **Auth is env-only and off by default.** With no `FORGE_WORKER_API_KEY` set, forge
+  sends no `Authorization`/API key to workers — BYO endpoints are assumed
+  network-protected (see [OPERATIONS §security](./OPERATIONS.md#security-posture)).
+  The key is never a flag and never logged (marked sensitive in the HTTP client).
 - **Health probe:** `GET {base_url}/health`; any 2xx = ready. Best-effort load metric
   read alongside it (vLLM `GET /metrics`, SGLang `GET /get_server_info`, llama.cpp
-  `GET /slots`, 2 s timeout).
+  `GET /slots`, 2 s timeout). Hosted hints skip the probe entirely — real responses
+  (429s, errors) drive AIMD and cooldown instead.
 - **Response handling:** 2xx → body decoded as JSON, `usage` captured into token
-  accounting (incl. the nested `prompt_tokens_details.cached_tokens` and
-  `completion_tokens_details.reasoning_tokens`), `x-request-id` header preserved if
-  present. 429/408/5xx/timeouts →
+  accounting per the *item's* endpoint shape — OpenAI-style (incl. the nested
+  `prompt_tokens_details.cached_tokens` and
+  `completion_tokens_details.reasoning_tokens`) or Anthropic Messages
+  (`input_tokens`/`output_tokens`; total derived) — `x-request-id` header preserved
+  if present. 429/408/5xx/timeouts →
   retried with full-jitter backoff up to `--max-attempts`. Other 4xx → terminal,
   dead-lettered without retry. A 2xx that fails `--require` validation is retried
   like a 5xx.

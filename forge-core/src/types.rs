@@ -17,6 +17,12 @@ pub enum EndpointKind {
     Chat,
     Completions,
     Embeddings,
+    /// Anthropic-native Messages endpoint (`/v1/messages`). The one deliberate
+    /// exception to "the wire contract is OpenAI-compatible": the request body is
+    /// passed through verbatim either way, so an item authored in the Anthropic
+    /// Messages shape (e.g. straight out of `forge import`'s Anthropic off-ramp)
+    /// drives an Anthropic-compatible endpoint natively.
+    Messages,
 }
 
 impl EndpointKind {
@@ -26,6 +32,7 @@ impl EndpointKind {
             EndpointKind::Chat => "/v1/chat/completions",
             EndpointKind::Completions => "/v1/completions",
             EndpointKind::Embeddings => "/v1/embeddings",
+            EndpointKind::Messages => "/v1/messages",
         }
     }
 
@@ -42,6 +49,8 @@ impl EndpointKind {
             Some(EndpointKind::Chat)
         } else if path.contains("/completions") {
             Some(EndpointKind::Completions)
+        } else if path.contains("/messages") {
+            Some(EndpointKind::Messages)
         } else {
             None
         }
@@ -59,6 +68,14 @@ pub enum EngineHint {
     Sglang,
     LlamaCpp,
     Router,
+    /// A hosted OpenAI-compatible API (no `/health` route, no queue-depth metric).
+    /// The worker skips the HTTP health probe (assumed ready) and, when
+    /// `FORGE_WORKER_API_KEY` is set, authenticates with `Authorization: Bearer`.
+    OpenAiApi,
+    /// A hosted Anthropic-compatible Messages API. Probe skipped (assumed ready);
+    /// `FORGE_WORKER_API_KEY` is sent as `x-api-key` plus the `anthropic-version`
+    /// header. Items should carry the Messages shape (`url: /v1/messages`).
+    AnthropicApi,
 }
 
 impl EngineHint {
@@ -76,8 +93,14 @@ impl EngineHint {
             EngineHint::Vllm => Some("/metrics"),
             EngineHint::Sglang => Some("/get_server_info"),
             EngineHint::LlamaCpp => Some("/slots"),
-            EngineHint::Router => None,
+            EngineHint::Router | EngineHint::OpenAiApi | EngineHint::AnthropicApi => None,
         }
+    }
+
+    /// Hosted provider APIs expose no health route — the worker assumes readiness
+    /// instead of probing, and readiness is learned from real responses.
+    pub fn is_hosted(self) -> bool {
+        matches!(self, EngineHint::OpenAiApi | EngineHint::AnthropicApi)
     }
 }
 
@@ -124,6 +147,28 @@ impl TokenUsage {
             total_tokens: get("total_tokens"),
             cached_tokens: nested("prompt_tokens_details", "cached_tokens"),
             reasoning_tokens: nested("completion_tokens_details", "reasoning_tokens"),
+        }
+    }
+
+    /// Parse an Anthropic Messages `usage` object (`input_tokens` /
+    /// `output_tokens`, with `cache_read_input_tokens` as the prefix-cache-hit
+    /// analog) into the same shape, so `forge cost` prices every provider's
+    /// tokens identically. Anthropic reports no total — it is derived.
+    pub fn from_anthropic_usage(v: &serde_json::Value) -> Self {
+        let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let output = get("output_tokens");
+        // Anthropic bills `input_tokens` (uncached), `cache_creation_input_tokens`
+        // (cache write), and `cache_read_input_tokens` (cache hit) as three distinct
+        // prompt-side buckets — all three belong in the prompt/total, not just the
+        // uncached figure, or cache-heavy requests get undercounted and underpriced.
+        let cache_read = get("cache_read_input_tokens");
+        let prompt = get("input_tokens") + get("cache_creation_input_tokens") + cache_read;
+        TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: output,
+            total_tokens: prompt + output,
+            cached_tokens: cache_read,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -423,6 +468,40 @@ mod tests {
         );
         assert_eq!(EndpointKind::from_path(""), None); // blank → caller's default
         assert_eq!(EndpointKind::from_path("/v1/rerank"), None);
+        assert_eq!(
+            EndpointKind::from_path("/v1/messages"),
+            Some(EndpointKind::Messages)
+        );
+    }
+
+    #[test]
+    fn anthropic_usage_maps_into_the_common_shape() {
+        let u = TokenUsage::from_anthropic_usage(&serde_json::json!({
+            "input_tokens": 320, "output_tokens": 48, "cache_read_input_tokens": 100
+        }));
+        // prompt_tokens folds in the cache-read bucket — it is real billable
+        // prompt-side input, not just the uncached `input_tokens` figure.
+        assert_eq!(u.prompt_tokens, 420);
+        assert_eq!(u.completion_tokens, 48);
+        assert_eq!(u.total_tokens, 468); // derived — Anthropic reports no total
+        assert_eq!(u.cached_tokens, 100);
+        // Missing fields default to 0, same contract as the OpenAI parser.
+        let bare = TokenUsage::from_anthropic_usage(&serde_json::json!({"input_tokens": 5}));
+        assert_eq!((bare.prompt_tokens, bare.total_tokens), (5, 5));
+    }
+
+    #[test]
+    fn anthropic_usage_also_folds_in_cache_creation_tokens() {
+        // A cache-write request: `cache_creation_input_tokens` (billed at a premium
+        // as a new cache entry) is a distinct bucket from both `input_tokens` and
+        // `cache_read_input_tokens`, and must be counted too.
+        let u = TokenUsage::from_anthropic_usage(&serde_json::json!({
+            "input_tokens": 50, "output_tokens": 10,
+            "cache_creation_input_tokens": 200, "cache_read_input_tokens": 0
+        }));
+        assert_eq!(u.prompt_tokens, 250);
+        assert_eq!(u.total_tokens, 260);
+        assert_eq!(u.cached_tokens, 0); // only cache *reads* count as "cached" hits
     }
 
     #[test]

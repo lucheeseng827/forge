@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-10
+
+### Added
+- **Hosted provider endpoints as workers.** `--engine openai-api` /
+  `--engine anthropic-api` drive hosted APIs directly: the env-only
+  `FORGE_WORKER_API_KEY` (never a flag, never logged) is sent in the
+  provider's own header style, the health probe is skipped (hosted APIs
+  expose none — real responses drive AIMD and cooldown), and the
+  **Anthropic Messages** shape is supported natively end to end:
+  `--endpoint messages` / per-item `url: /v1/messages`, content
+  validation on `content[0].text`, and `input_tokens`/`output_tokens`
+  (plus `cache_read_input_tokens`) metered into the same cost ledger as
+  every other provider. With no key set, behavior is unchanged: no auth
+  headers, ever.
+- Provider-neutral docs: the worker-compatibility matrix in
+  [docs/API.md](./docs/API.md) is the single answer to "what can be a
+  forge worker" — self-hosted OpenAI-compatible engines, hosted
+  OpenAI-compatible APIs, and hosted Anthropic-compatible Messages APIs.
+
 ## [0.1.1] — 2026-07-10
 
 ### Changed
@@ -83,6 +102,7 @@ interruptions, and prove completeness — as a single static binary.
   OpenAI SDK code runs its batch flow against your own endpoints, with real
   per-item progress and mid-run partial results.
 
-[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/lucheeseng827/forge/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lucheeseng827/forge/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lucheeseng827/forge/releases/tag/v0.1.0

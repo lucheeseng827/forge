@@ -626,7 +626,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "forge-batch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "forge-core",
  "forge-queue",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures-util",
  "rand 0.8.6",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "forge-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "forge-queue"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "forge-core",
  "redb",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "forge-shard"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "forge-core",
  "forge-queue",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "forge-spot"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "forge-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "forge-worker"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "forge-core",
  "governor",

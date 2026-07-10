@@ -25,7 +25,7 @@ use forge_worker::HttpWorker;
 #[command(
     name = "forge",
     version,
-    about = "Offline/batch inference coordinator — fan a giant JSONL across N (spot) GPUs running vLLM/SGLang/llama.cpp. NOT a workflow/DAG scheduler."
+    about = "Offline/batch inference coordinator — fan a giant JSONL across N workers: any OpenAI-compatible engine (vLLM/SGLang/llama.cpp/…) or hosted provider endpoint. NOT a workflow/DAG scheduler."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -312,6 +312,11 @@ enum EngineArg {
     Sglang,
     Llamacpp,
     Router,
+    /// A hosted OpenAI-compatible API (probe skipped; FORGE_WORKER_API_KEY → Bearer).
+    OpenaiApi,
+    /// A hosted Anthropic-compatible Messages API (probe skipped;
+    /// FORGE_WORKER_API_KEY → x-api-key + anthropic-version).
+    AnthropicApi,
 }
 
 impl From<EngineArg> for EngineHint {
@@ -320,6 +325,8 @@ impl From<EngineArg> for EngineHint {
             EngineArg::Vllm => EngineHint::Vllm,
             EngineArg::Sglang => EngineHint::Sglang,
             EngineArg::Llamacpp => EngineHint::LlamaCpp,
+            EngineArg::OpenaiApi => EngineHint::OpenAiApi,
+            EngineArg::AnthropicApi => EngineHint::AnthropicApi,
             EngineArg::Router => EngineHint::Router,
         }
     }
@@ -330,6 +337,8 @@ enum EndpointArg {
     Chat,
     Completions,
     Embeddings,
+    /// Anthropic-native Messages (/v1/messages) — items carry the Messages body shape.
+    Messages,
 }
 
 impl From<EndpointArg> for EndpointKind {
@@ -337,6 +346,7 @@ impl From<EndpointArg> for EndpointKind {
         match e {
             EndpointArg::Chat => EndpointKind::Chat,
             EndpointArg::Completions => EndpointKind::Completions,
+            EndpointArg::Messages => EndpointKind::Messages,
             EndpointArg::Embeddings => EndpointKind::Embeddings,
         }
     }
