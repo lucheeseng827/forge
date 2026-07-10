@@ -1,0 +1,14 @@
+# Keep the image build context to source only: the multi-GB target/ tree (and
+# any churn inside it mid-tar) must never reach the daemon, and no tree outside
+# the OSS workspace may enter an image build context at all (the e[e]/ pattern
+# is a character class only so the path never appears literally here).
+target/
+e[e]/
+.forge/
+*.db
+*.jsonl
+deploy/
+docs/
+examples/
+BENCHMARKS.md
+DOCKERHUB.md
