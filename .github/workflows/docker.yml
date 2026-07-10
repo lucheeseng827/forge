@@ -1,0 +1,179 @@
+# Build + push the official multi-arch forge image AND the OCI Helm chart to
+# Docker Hub (docker.io/mancube/forge and oci://registry-1.docker.io/mancube/forge-chart).
+# Lives ONLY on this public repo — the monorepo sync never touches .github, so
+# this is the mirror-native publish path (same pattern as dagron's docker.yml):
+# the release artifacts are built IN the open repo, from the open source.
+#
+# Requires two secrets in this repo's `cicd` environment:
+#   DOCKER_USERNAME — a Docker Hub user with push access to mancube/forge*
+#   DOCKER_PASSWORD — a Docker Hub access token (Read/Write)
+#
+# Fires automatically on the full-semver version tags the OSS sync stamps here
+# (`v0.1.1` → mancube/forge:v0.1.1 + :latest and forge-chart:0.1.1; a prerelease
+# tag publishes the version tags but not :latest). Manual dispatch takes an
+# explicit version.
+#
+# Each architecture builds NATIVELY — amd64 on ubuntu-latest, arm64 on GitHub's
+# free-for-public-repos arm runners — then a merge job stitches one multi-arch
+# manifest. No QEMU (the emulated arm64 Rust build is punishingly slow).
+
+name: Publish Docker image + Helm chart
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, without the v (e.g. 0.1.1)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Push by digest only — the merge job below owns the human-readable tags.
+      - name: Build + push forge (${{ matrix.platform }}, native)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=docker.io/mancube/forge,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=docker-forge-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-forge-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-forge-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - name: Collect per-arch digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-forge-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # forge's image tags are v-prefixed (v0.1.1) — the chart's default
+      # image.tag and the existing manually-pushed tags follow that convention.
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: mancube/forge
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=raw,value=v${{ github.event.inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'docker.io/mancube/forge@sha256:%s ' *)
+
+      - name: Inspect published image
+        run: docker buildx imagetools inspect "docker.io/mancube/forge:${{ steps.meta.outputs.version }}"
+
+  # Package + push the Helm chart (OCI) after the image exists, so a single v*
+  # tag publishes the whole stack. The chart is NAMED forge-chart so its OCI repo
+  # sits beside the mancube/forge image repo without colliding.
+  chart:
+    needs: merge
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            V="$DISPATCH_VERSION"
+          else
+            V="${GITHUB_REF_NAME#v}"   # refs/tags/v0.1.1 -> 0.1.1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "chart version $V"
+
+      - name: Package + push Helm chart (OCI)
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$DOCKER_PASSWORD" | \
+            helm registry login registry-1.docker.io -u "$DOCKER_USERNAME" --password-stdin
+          # Keep the packaged chart's default image tag in lockstep with vV so a
+          # 0.1.1 chart pulls the v0.1.1 image (not a stale tag).
+          sed -i -E "s#^([[:space:]]*tag:[[:space:]]*).*#\1\"v${V}\"#" deploy/helm/forge/values.yaml
+          helm package deploy/helm/forge --version "$V" --app-version "$V" -d dist
+          # Seatbelt: the OSS chart must never carry anything from a closed tree.
+          if tar -tzf "dist/forge-chart-$V.tgz" | grep -E '/ee/'; then
+            echo "::error::closed-tree path present in chart package — refusing to push"
+            exit 1
+          fi
+          helm push "dist/forge-chart-$V.tgz" "oci://registry-1.docker.io/mancube"
+          echo "Pushed oci://registry-1.docker.io/mancube/forge-chart:$V"
