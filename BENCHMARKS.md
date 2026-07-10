@@ -138,3 +138,40 @@ Same sim (true cap 8, tight admission queue), 200 items, declared concurrency 64
 forge's AIMD halves the in-flight window on each 429 burst and the shared
 per-worker cooldown honors `Retry-After`, so the whole fleet backs off in
 lockstep — 94% less rejected traffic, and nothing dead-lettered.
+
+## Isolated cloud run: real network, resource headroom (EC2)
+
+**The claim:** the coordinator is effectively free — single-digit MB of RAM and
+under 1% of one core while saturating a cross-node fleet — so forge adds
+scheduling, durability, and accounting without meaningfully taxing the box it
+runs on.
+
+Run 2026-07-10, ap-southeast-1, release build built on the box from this repo.
+Coordinator: c6i.2xlarge (8 vCPU). Fleet: 3 × c6i.large worker nodes, each
+running `examples/engine_sim.py` (`ENGINE_SIM_HOST=0.0.0.0`) — two at cap 8
+@ 600 ms, one weak at cap 4 @ 1200 ms. Real VPC HTTP between nodes,
+`--concurrency 8`, no tuning. Resource figures are 0.5 s `/proc` samples of the
+forge process; latency percentiles come from the per-item `latency_ms` forge
+records in the results JSONL.
+
+| Scenario | items | items/s | vs naive | item p50/p95/p99 (ms) | forge RSS peak | forge CPU mean/peak |
+|---|---|---|---|---|---|---|
+| naive sequential client, 1 local sim | 40 | 1.67 | 1× | — | — | — |
+| forge → 1 local sim (cap 8) | 400 | **12.25** | 7.3× (92% of ceiling) | 649 / 809 / 819 | 7.6 MB | 0.5% / 4% |
+| forge → 3 local sims (mixed) | 400 | **24.39** | 14.6× | 669 / 2499 / 2829 | 7.7 MB | 0.9% / 4% |
+| forge → 3 **remote** worker nodes (mixed, VPC) | 800 | **26.89** | 16.1× (~90% of the 30/s fleet ceiling) | 669 / 2399 / 2738 | **9.7 MB** | **0.9% / 2%** |
+
+Every run: all items done, zero dead-letters. The mixed-fleet p95/p99 tail is
+the weak box's own queue (cap 4 @ 1200 ms serving its share at its own pace) —
+the sliding window keeps it from slowing anyone else down, which is why fleet
+throughput stays at the sum of the engines.
+
+Headroom, extrapolated conservatively from the samples: at ~27 items/s the
+coordinator spends <1% of one core and <10 MB RSS — the dispatch path has two
+orders of magnitude of headroom before the coordinator itself could become the
+bottleneck (the durable queue's write path would bind first).
+
+Cost of the entire measured run, on-demand: ≈ $0.42 (4 nodes × ~35 minutes).
+
+Reproduce: launch any 3 boxes that can reach each other on :8000, run the sim
+with `ENGINE_SIM_HOST=0.0.0.0`, point `forge run --workers` at their addresses.

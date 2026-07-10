@@ -10,6 +10,7 @@ Models what a real vLLM/SGLang box does under load, without a GPU:
 Usage: realistic_engine.py PORT CAP BASE_LATENCY_MS [QUEUE_FACTOR]
 """
 import json
+import os
 import random
 import sys
 import threading
@@ -20,6 +21,8 @@ PORT = int(sys.argv[1])
 CAP = int(sys.argv[2])
 BASE_MS = float(sys.argv[3])
 QUEUE_FACTOR = float(sys.argv[4]) if len(sys.argv) > 4 else 3.0
+# Bind loopback by default; multi-node benches set ENGINE_SIM_HOST=0.0.0.0.
+HOST = os.environ.get("ENGINE_SIM_HOST", "127.0.0.1")
 
 slots = threading.Semaphore(CAP)
 lock = threading.Lock()
@@ -100,8 +103,8 @@ class H(BaseHTTPRequestHandler):
         self._reply(200, body)
 
 
-print(f"engine sim :{PORT} cap={CAP} base={BASE_MS}ms queue_factor={QUEUE_FACTOR}", flush=True)
-srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
+print(f"engine sim {HOST}:{PORT} cap={CAP} base={BASE_MS}ms queue_factor={QUEUE_FACTOR}", flush=True)
+srv = ThreadingHTTPServer((HOST, PORT), H)
 try:
     srv.serve_forever()
 finally:
