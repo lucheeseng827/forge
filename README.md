@@ -321,10 +321,12 @@ down, or autoscales instances.
 - [x] **`forge-store` implemented (P1.5):** `JsonlStore` — append-only result
       JSONL + sibling dead-letter file, idempotent/dedup-on-resume via an
       emitted-id set seeded from the existing files
-- [x] **Concurrent dispatch (P1.1):** a leased batch is fanned out with
-      `buffer_unordered` up to the fleet's total capacity (Σ `concurrency_limit`),
-      round-robin across ready workers, each worker's in-flight semaphore the hard
-      throttle — no `spawn`/`Arc` (futures borrow `&self`)
+- [x] **Concurrent dispatch (P1.1, upgraded to a sliding window):** up to the
+      fleet's total capacity (Σ `concurrency_limit`) items are in flight at once,
+      and every completion immediately frees a slot that is topped up against the
+      workers' FREE slots — so a slow worker only ever occupies its own slots and
+      can never head-of-line-block the fleet. Each worker's in-flight semaphore
+      stays the hard throttle — no `spawn`/`Arc` (futures borrow `&self`)
 - [x] **Lease fencing & resume ergonomics:** `ack`/`dead_letter` are fenced on the
       lease generation (a stale worker can't close a re-leased item); `run` records
       the output path so `resume` reuses it automatically (no split export)

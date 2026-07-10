@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::error::ForgeError;
 use crate::retry::RetryPolicy;
@@ -111,8 +111,30 @@ fn dispatch_assignment(
 
     let any_known = load_aware && loads.iter().any(Option::is_some);
     if !any_known {
-        // Exact prior behavior: flat round-robin seeded by `base`.
-        return (0..n_items).map(|i| (base + i) % n).collect();
+        // No load signal → rotation-fair round-robin, but **capacity-bounded**: a
+        // worker whose `caps[w]` (its currently-free slots, when the caller passes
+        // free slots rather than full capacity) is exhausted is skipped, so a busy
+        // worker never accumulates a backlog that head-of-line-blocks the window.
+        // If the caller leases more than the total capacity (legacy callers passing
+        // full caps), fall back to the exact flat `(base + i) % n` rotation.
+        let total: usize = caps.iter().sum();
+        if n_items > total {
+            return (0..n_items).map(|i| (base + i) % n).collect();
+        }
+        let mut free = caps.to_vec();
+        let mut assign = Vec::with_capacity(n_items);
+        let mut cursor = base;
+        while assign.len() < n_items {
+            // Next worker in rotation with a free slot (total ≥ n_items guarantees one).
+            let mut w = cursor % n;
+            while free[w] == 0 {
+                w = (w + 1) % n;
+            }
+            free[w] -= 1;
+            assign.push(w);
+            cursor = w + 1;
+        }
+        return assign;
     }
 
     // Order ready workers by (load asc, round-robin-rotated tiebreak) so equal-load
@@ -121,13 +143,16 @@ fn dispatch_assignment(
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&w| (loads[w].unwrap_or(u32::MAX), (w + n - rot) % n));
 
-    // Fill least-loaded first, bounded by each worker's capacity.
+    // Fill least-loaded first, bounded by each worker's capacity. A worker with no
+    // capacity left (the caller passes FREE slots) is skipped outright — assigning
+    // it anyway would queue the item behind its semaphore and reintroduce
+    // head-of-line blocking inside the window.
     let mut assign = Vec::with_capacity(n_items);
     for &w in &order {
         if assign.len() == n_items {
             break;
         }
-        let take = caps[w].max(1).min(n_items - assign.len());
+        let take = caps[w].min(n_items - assign.len());
         for _ in 0..take {
             assign.push(w);
         }
@@ -239,10 +264,13 @@ where
 
     /// Drain the queue to terminal states and return aggregate totals.
     ///
-    /// A leased batch is dispatched **concurrently**: up to the fleet's total
+    /// Dispatch is a **sliding window**, not batched waves: up to the fleet's total
     /// capacity (Σ `concurrency_limit` over ready workers) items are in flight at
-    /// once, round-robin'd across workers, with each worker's own in-flight
-    /// semaphore as the hard throttle so no engine is oversubscribed.
+    /// once, and every completion immediately frees a slot that is topped up with a
+    /// fresh lease — so a slow worker only ever occupies *its own* slots and can
+    /// never gate the rest of the fleet (no head-of-line blocking at batch
+    /// boundaries on heterogeneous fleets). Each worker's own in-flight semaphore
+    /// remains the hard throttle, so no engine is oversubscribed.
     ///
     /// Loop invariant — the exactly-once-*effect* ordering: each result is written
     /// to the store **before** its item is acked. A crash in between leaves the
@@ -260,18 +288,48 @@ where
         // When the fleet first went unready; we give up once `ready_grace` of
         // wall-clock has actually elapsed (not a rounded count of poll cycles).
         let mut idle_since: Option<Instant> = None;
+        // The sliding window of in-flight dispatches. Futures borrow `&self`, so
+        // there is still no spawn / Arc / Send requirement. Each future resolves to
+        // `(worker index, outcome)` so the per-worker in-flight ledger below stays
+        // exact as completions land.
+        let mut in_flight = FuturesUnordered::new();
+        // Per-worker in-flight count (global index into `self.workers`). New leases
+        // are assigned only against a worker's FREE slots — this is what prevents a
+        // slow worker's backlog from silting up the window and re-creating
+        // head-of-line blocking one layer down (at its semaphore).
+        let mut wf: Vec<usize> = vec![0; self.workers.len()];
+        // Reap on a wall-clock cadence instead of once per wave — topping up happens
+        // on every completion, and a queue round-trip per completion is fine, but a
+        // reap sweep per completion is not.
+        let mut last_reap: Option<Instant> = None;
 
         loop {
-            // Re-queue anything a dead worker left leased before we lease more.
-            let reaped = self.queue.reap().await?;
-            if reaped > 0 {
-                tracing::debug!(reaped, "re-queued expired leases");
+            // Re-queue anything a dead worker left leased, on a poll-interval cadence
+            // (and always on the first pass / when the window has fully drained).
+            if last_reap.map_or(true, |t| t.elapsed() >= self.cfg.poll_interval)
+                || in_flight.is_empty()
+            {
+                let reaped = self.queue.reap().await?;
+                if reaped > 0 {
+                    tracing::debug!(reaped, "re-queued expired leases");
+                }
+                last_reap = Some(Instant::now());
             }
 
             // Don't lease work no worker can serve; re-probe and wait for the fleet.
             if !self.any_ready() {
                 self.probe_all().await;
                 if !self.any_ready() {
+                    // Let anything already in flight land first (its worker accepted
+                    // it before going unready; readiness only gates NEW leases).
+                    if let Some((widx, outcome)) = in_flight.next().await {
+                        wf[widx] -= 1;
+                        match outcome? {
+                            Dispatched::Done(usage) => totals.record_done(&usage),
+                            Dispatched::Dead => totals.items_dead += 1,
+                        }
+                        continue;
+                    }
                     if self.queue.counts().await?.is_drained() {
                         break;
                     }
@@ -289,60 +347,76 @@ where
             }
             idle_since = None; // a worker is ready
 
-            // The ready fleet and its total in-flight capacity for this round.
-            let ready: Vec<&W> = self.workers.iter().filter(|w| w.is_ready()).collect();
-            let caps: Vec<usize> = ready
+            // The ready fleet (by global index) and each member's FREE slots right
+            // now — declared capacity minus what it already has in flight.
+            let ready: Vec<usize> = self
+                .workers
                 .iter()
-                .map(|w| w.spec().concurrency_limit.max(1))
+                .enumerate()
+                .filter(|(_, w)| w.is_ready())
+                .map(|(g, _)| g)
                 .collect();
-            let capacity: usize = caps.iter().sum::<usize>().max(1);
-
-            // Lease only what this round can actually start dispatching (≤ fleet
-            // capacity), so no leased item sits idle with its lease clock running
-            // while it waits behind `buffer_unordered`. `lease_batch` is the ceiling.
-            let lease_n = self.cfg.lease_batch.min(capacity).max(1);
-            // Adaptive TTL: grow with observed latency so a slow generation isn't
-            // re-queued mid-flight, capped at `lease_max`.
-            let lease_for = adaptive_lease(
-                self.cfg.lease_for,
-                self.cfg.lease_max,
-                self.peak_latency_ms.load(Ordering::Relaxed),
-            );
-            if lease_for > self.cfg.lease_for {
-                tracing::debug!(?lease_for, "lease TTL grown to cover observed latency");
-            }
-            let batch = self.queue.lease(lease_n, lease_for).await?;
-
-            if batch.is_empty() {
-                if self.queue.counts().await?.is_drained() {
-                    break;
-                }
-                // Work is leased elsewhere / in flight; wait, then reap + re-poll.
-                tokio::time::sleep(self.cfg.poll_interval).await;
-                continue;
-            }
-
-            // Fan the batch out across the ready workers, polling up to `capacity` at
-            // once. `buffer_unordered` + the per-worker semaphores bound real in-flight
-            // requests; futures borrow `&self`, so there is no spawn / Arc / Send
-            // requirement. The per-item worker pick is the **load-aware** assignment
-            // (B3) — a synchronous pre-computed index, biased toward the least-loaded
-            // engine when metrics are available and exactly round-robin otherwise.
-            let base = rr;
-            let loads: Vec<Option<u32>> = ready.iter().map(|w| w.load()).collect();
-            let assign = dispatch_assignment(&loads, &caps, base, batch.len(), self.cfg.load_aware);
-            let outcomes: Vec<Dispatched> = stream::iter(batch.iter().enumerate())
-                .map(|(i, item)| {
-                    let worker = ready[assign[i]];
-                    self.dispatch_one(worker, item)
+            let free: Vec<usize> = ready
+                .iter()
+                .map(|&g| {
+                    self.workers[g]
+                        .spec()
+                        .concurrency_limit
+                        .max(1)
+                        .saturating_sub(wf[g])
                 })
-                .buffer_unordered(capacity)
-                .try_collect()
-                .await?;
-            rr = rr.wrapping_add(batch.len());
+                .collect();
 
-            for outcome in outcomes {
-                match outcome {
+            // Top the window up. Lease only what has a free slot to start on RIGHT
+            // NOW, so no leased item sits idle (with its lease clock running) behind
+            // a busy worker's semaphore. `lease_batch` is the per-round-trip ceiling.
+            let deficit = free.iter().sum::<usize>().min(self.cfg.lease_batch);
+            if deficit > 0 {
+                // Adaptive TTL: grow with observed latency so a slow generation isn't
+                // re-queued mid-flight, capped at `lease_max`.
+                let lease_for = adaptive_lease(
+                    self.cfg.lease_for,
+                    self.cfg.lease_max,
+                    self.peak_latency_ms.load(Ordering::Relaxed),
+                );
+                if lease_for > self.cfg.lease_for {
+                    tracing::debug!(?lease_for, "lease TTL grown to cover observed latency");
+                }
+                let batch = self.queue.lease(deficit, lease_for).await?;
+
+                if batch.is_empty() && in_flight.is_empty() {
+                    if self.queue.counts().await?.is_drained() {
+                        break;
+                    }
+                    // Work is leased elsewhere (e.g. an expired-but-unreaped lease);
+                    // wait, then reap + re-poll.
+                    tokio::time::sleep(self.cfg.poll_interval).await;
+                    continue;
+                }
+
+                // The per-item worker pick is the **load-aware** assignment (B3) — a
+                // synchronous pre-computed index over each ready worker's FREE slots
+                // (never its full capacity), biased toward the least-loaded engine
+                // when metrics are available and capacity-bounded round-robin
+                // otherwise — so a saturated worker is skipped, not queued behind.
+                let loads: Vec<Option<u32>> =
+                    ready.iter().map(|&g| self.workers[g].load()).collect();
+                let assign =
+                    dispatch_assignment(&loads, &free, rr, batch.len(), self.cfg.load_aware);
+                rr = rr.wrapping_add(batch.len());
+                for (i, item) in batch.into_iter().enumerate() {
+                    let g = ready[assign[i]];
+                    let worker = &self.workers[g];
+                    wf[g] += 1;
+                    in_flight.push(async move { (g, self.dispatch_one(worker, &item).await) });
+                }
+            }
+
+            // Consume exactly ONE completion, then loop to top the freed slot back up
+            // — this is what makes the window slide instead of draining in waves.
+            if let Some((widx, outcome)) = in_flight.next().await {
+                wf[widx] -= 1;
+                match outcome? {
                     Dispatched::Done(usage) => totals.record_done(&usage),
                     Dispatched::Dead => totals.items_dead += 1,
                 }
