@@ -12,8 +12,8 @@ Source, docs, benchmarks: <https://github.com/lucheeseng827/forge> (Apache-2.0)
 
 | Tag | What |
 |---|---|
-| `latest`, `v0.1.0` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
-| `v0.1.0-amd64`, `v0.1.0-arm64` | pinned single-arch |
+| `latest`, `v0.1.1` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
+| `v0.1.1-amd64`, `v0.1.1-arm64` (and prior versions) | pinned single-arch |
 
 ## Quick start — run a batch
 
@@ -21,7 +21,7 @@ Source, docs, benchmarks: <https://github.com/lucheeseng827/forge> (Apache-2.0)
 # input.jsonl: one OpenAI Batch-format request per line, keyed by custom_id
 docker run --rm --network host \
   -v "$PWD:/work" -w /work \
-  mancube/forge:v0.1.0 \
+  mancube/forge:v0.1.1 \
   run --input input.jsonl \
       --workers http://gpu1:8000,http://gpu2:8000 \
       --engine vllm --concurrency 256 \
@@ -33,9 +33,9 @@ Kill it mid-run (or lose the box) and run the same command again — it
 re-run, and `verify` proves every input id reached a terminal result.
 
 ```sh
-docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.0 \
+docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.1 \
   status --checkpoint state.db          # counts, success rate, failure mix
-docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.0 \
+docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.1 \
   verify --input input.jsonl --results results.jsonl
 ```
 
@@ -46,7 +46,7 @@ user), or add `--user "$(id -u)"`.
 
 ```sh
 docker run --rm -p 8080:8080 -v forge-data:/data \
-  mancube/forge:v0.1.0 \
+  mancube/forge:v0.1.1 \
   serve-batch --listen 0.0.0.0:8080 --data-dir /data \
     --workers http://gpu1:8000 --engine vllm --concurrency 256 \
     --api-key "$FORGE_API_KEY"
@@ -59,7 +59,15 @@ the unauthenticated liveness route; everything else requires the bearer key.
 
 ## Kubernetes
 
-A Helm chart ships in the repo
+The chart is published as an OCI artifact right beside this image:
+
+```sh
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.1 \
+  --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
+  --set 'serveBatch.apiKey=<bearer key>'
+```
+
+The same chart ships in the repo
 ([`deploy/helm/forge`](https://github.com/lucheeseng827/forge/tree/main/deploy/helm/forge)):
 `serve-batch` as a Deployment (PVC, probes, Secret-backed key) and one-shot
 `forge run` as a Job whose PVC-backed checkpoint turns pod evictions into

@@ -1,9 +1,11 @@
+{{/* The chart is NAMED forge-chart only because the OCI repo sits beside the
+     mancube/forge image repo; every in-cluster name stays plain "forge". */}}
 {{- define "forge.name" -}}
-{{- .Chart.Name -}}
+forge
 {{- end -}}
 
 {{- define "forge.fullname" -}}
-{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name (include "forge.name" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "forge.labels" -}}

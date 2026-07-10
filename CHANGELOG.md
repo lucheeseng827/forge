@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-10
+
+### Changed
+- **Sliding-window dispatch** replaces wave-based batching: completions
+  immediately free slots that are topped up against workers' FREE capacity, so
+  a slow worker can no longer head-of-line-block a mixed fleet (measured: a
+  2-fast + 1-weak fleet went from *slower than one fast box* to 2.8× faster;
+  single-box throughput +20% to ~97% of the engine ceiling).
+- `forge resume` now reuses the per-worker `--concurrency` the original `run`
+  recorded in the checkpoint (explicit flag still wins, warned on divergence)
+  — a bare resume can no longer restart AIMD at a ceiling the fleet was not
+  configured for.
+
+### Added
+- **Kubernetes**: repo-root `Dockerfile` (FROM-scratch, ~5 MB, nonroot) and the
+  `deploy/helm/forge` chart — `serve-batch` as a Deployment (PVC, probes,
+  Secret-backed bearer key) and one-shot `forge run` as a Job whose PVC-backed
+  checkpoint turns evictions into resumes. Official multi-arch images at
+  `docker.io/mancube/forge`; the chart ships as an OCI artifact at
+  `oci://registry-1.docker.io/mancube/forge-chart`.
+- **BENCHMARKS**: fleet-scheduling and overload-safety sections, plus an
+  isolated EC2 run (cross-node fleet ~90% of ceiling; coordinator at ~10 MB
+  RSS / <1% CPU); `examples/engine_sim.py` ships the reproducible engine sim.
+
 ## [0.1.0] — first public release
 
 The batch-inference coordinator, end to end: fan a JSONL of independent
@@ -59,5 +83,6 @@ interruptions, and prove completeness — as a single static binary.
   OpenAI SDK code runs its batch flow against your own endpoints, with real
   per-item progress and mid-run partial results.
 
-[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/lucheeseng827/forge/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lucheeseng827/forge/releases/tag/v0.1.0

@@ -14,15 +14,21 @@ Two shapes, independently toggleable:
 ## Quick start
 
 ```sh
+# from the OCI registry (no checkout needed):
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.1 \
+  --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
+  --set 'serveBatch.apiKey=<key>'
+
+# or from a repo checkout:
 helm install forge deploy/helm/forge \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000,http://vllm-1.engines.svc:8000}' \
   --set serveBatch.concurrency=256 \
-  --set serveBatch.apiKey=<bearer key>
+  --set 'serveBatch.apiKey=<bearer key>'
 ```
 
 The default image is the official multi-arch `docker.io/mancube/forge`
 (linux/amd64 + linux/arm64, ~5 MB, FROM scratch). Building your own instead:
-`docker build -t <registry>/forge:v0.1.0 .` from the repo root, push it, and
+`docker build -t <registry>/forge:v0.1.1 .` from the repo root, push it, and
 set `image.repository`.
 
 Then any OpenAI SDK pointed at `http://<service>:8080/v1` runs its batch flow
