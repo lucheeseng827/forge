@@ -1,0 +1,14 @@
+{{- if .Values.serveBatch.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "forge.fullname" . }}
+  labels: {{- include "forge.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector: {{- include "forge.selectorLabels" . | nindent 4 }}
+{{- end }}

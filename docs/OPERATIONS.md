@@ -24,6 +24,12 @@ forge run --input prompts.jsonl --workers http://gpu1:8000,http://gpu2:8000 \
 
 Tagged releases are built and published as static binaries by CI.
 
+**Kubernetes:** [`deploy/helm/forge`](../deploy/helm/forge/README.md) runs the
+coordinator in-cluster — `serve-batch` as a Deployment (data-dir PVC, health
+probes, bearer-key Secret) and one-shot `forge run` as a Job whose PVC-backed
+checkpoint turns pod evictions into resumes. Engines stay BYO Services; build
+the image from the repo-root [`Dockerfile`](../Dockerfile).
+
 Placement rules:
 
 - **One coordinator per checkpoint DB.** The coordinator is the single writer; the

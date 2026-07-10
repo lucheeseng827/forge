@@ -203,6 +203,9 @@ file target/x86_64-unknown-linux-musl/release/forge   # → ELF, static-pie, str
 
 The result is a ~4 MB fully static, dependency-free binary that boots and starts
 dispatching in well under a second. Tagged releases build and publish it via CI.
+A [`Dockerfile`](./Dockerfile) wraps the same binary in a FROM-scratch image, and
+[`deploy/helm/forge`](./deploy/helm/forge/README.md) runs it on Kubernetes
+(`serve-batch` Deployment + one-shot `run` Job with resume-on-eviction).
 
 **Zero-C alternative.** The `redb` queue backend (`forge-queue` feature `redb`) is
 pure Rust, so an embedder that wants the cleanest cross-compile (no C toolchain at

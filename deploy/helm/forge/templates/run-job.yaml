@@ -1,0 +1,72 @@
+{{- if .Values.runJob.enabled }}
+{{- $workers := .Values.runJob.workers | default .Values.serveBatch.workers }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "forge.fullname" . }}-run
+  labels: {{- include "forge.labels" . | nindent 4 }}
+spec:
+  # A fresh `forge run` against an existing checkpoint IS a resume (idempotent
+  # hydrate + lease expiry), so container restarts and Job retries pick the
+  # batch up where it left off — checkpoint and results live on the Job's PVC.
+  backoffLimit: {{ .Values.runJob.backoffLimit }}
+  template:
+    metadata:
+      labels: {{- include "forge.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: forge-run
+          image: {{ include "forge.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - run
+            - --input
+            - {{ .Values.runJob.input }}
+            - --workers
+            - {{ required "runJob.workers (or serveBatch.workers) needs at least one engine URL" (join "," $workers) }}
+            - --engine
+            - {{ .Values.runJob.engine }}
+            - --concurrency
+            - {{ .Values.runJob.concurrency | quote }}
+            - --out
+            - /work/results.jsonl
+            - --checkpoint
+            - /work/state.db
+            {{- range .Values.runJob.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            {{- if .Values.runJob.inputVolume }}
+            - name: input
+              mountPath: /input
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: {{ include "forge.fullname" . }}-run-work
+        {{- if .Values.runJob.inputVolume }}
+        - name: input
+          {{- toYaml .Values.runJob.inputVolume | nindent 10 }}
+        {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "forge.fullname" . }}-run-work
+  labels: {{- include "forge.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.runJob.persistence.size }}
+  {{- if .Values.runJob.persistence.storageClass }}
+  storageClassName: {{ .Values.runJob.persistence.storageClass }}
+  {{- end }}
+{{- end }}

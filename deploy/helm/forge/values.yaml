@@ -1,0 +1,85 @@
+# forge chart values.
+#
+# There is no published forge image (yet): build one from the repo-root
+# Dockerfile and push it to your registry, then set image.repository. The chart
+# refuses to render without it — a silent default pointing at a registry we
+# don't control would be worse.
+
+image:
+  repository: ""            # REQUIRED, e.g. ghcr.io/you/forge
+  tag: "v0.1.0"
+  pullPolicy: IfNotPresent
+
+# ── serve-batch: the long-running OpenAI Batch REST front door ────────────────
+serveBatch:
+  enabled: true
+  replicas: 1                # keep 1: each replica owns its own data-dir/queues
+  port: 8080
+  threads: 2
+  # BYO OpenAI-compatible engine endpoints, reachable from the pod
+  # (typically in-cluster Services in front of your vLLM/SGLang pods).
+  workers:
+    - http://vllm-0.engines.svc:8000
+  engine: vllm               # vllm | sglang | llamacpp | router (probe shape only)
+  concurrency: 8             # per-worker in-flight cap = the engine's own knob
+  # Bearer auth for every route except /v1/health.
+  # Either inline (goes into a chart-managed Secret)…
+  apiKey: ""
+  # …or reference an existing Secret (wins over apiKey when set).
+  existingApiKeySecret: ""
+  existingApiKeySecretKey: api-key
+  extraArgs: []              # appended verbatim, e.g. ["--require", "json"]
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""           # "" = cluster default
+  accessModes: [ReadWriteOnce]
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# The measured coordinator footprint is ~10 MB RSS / <1% CPU at ~27 items/s
+# (see BENCHMARKS.md), so these tiny defaults are generous, not optimistic.
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ── runJob: a one-shot `forge run` as a Kubernetes Job ────────────────────────
+# The checkpoint lives on the PVC, and the Job restarts the container on
+# failure — because a fresh `forge run` against an existing checkpoint IS a
+# resume (idempotent hydrate + lease expiry), an eviction or node loss picks up
+# where it left off instead of starting over. Mount your input JSONL via
+# runJob.inputVolume (any volume source: PVC, configMap for small files, etc.).
+runJob:
+  enabled: false
+  input: /input/batch.jsonl
+  workers: []                # defaults to serveBatch.workers when empty
+  engine: vllm
+  concurrency: 8
+  extraArgs: []              # e.g. ["--prefix-bucket", "--max-attempts", "3"]
+  backoffLimit: 6
+  inputVolume: {}            # e.g. {persistentVolumeClaim: {claimName: my-input}}
+  persistence:
+    size: 10Gi
+    storageClass: ""

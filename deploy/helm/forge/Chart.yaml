@@ -1,0 +1,13 @@
+apiVersion: v2
+name: forge
+description: >-
+  forge batch-inference coordinator on Kubernetes: the OpenAI Batch REST front
+  door (`forge serve-batch`) as a Deployment, and one-shot `forge run` batches
+  as a Job whose checkpoint lives on a PVC — so a pod eviction or node loss
+  resumes instead of restarting. Engines (vLLM / SGLang / llama.cpp) are BYO
+  endpoints; this chart deliberately deploys none.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [llm, batch-inference, openai-batch]
+sources: [https://github.com/lucheeseng827/forge]

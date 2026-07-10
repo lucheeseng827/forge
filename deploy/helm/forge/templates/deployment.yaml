@@ -1,0 +1,87 @@
+{{- if .Values.serveBatch.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "forge.fullname" . }}
+  labels: {{- include "forge.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.serveBatch.replicas }}
+  {{- if gt (int .Values.serveBatch.replicas) 1 }}
+  {{- fail "serveBatch.replicas must be 1: each replica owns its own data-dir and batch queues; run separate releases for separate trust domains" }}
+  {{- end }}
+  strategy:
+    type: Recreate            # the data-dir PVC is RWO; never two writers
+  selector:
+    matchLabels: {{- include "forge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "forge.selectorLabels" . | nindent 8 }}
+    spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: forge
+          image: {{ include "forge.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve-batch
+            - --listen
+            - 0.0.0.0:{{ .Values.serveBatch.port }}
+            - --data-dir
+            - /data
+            - --threads
+            - {{ .Values.serveBatch.threads | quote }}
+            - --workers
+            - {{ required "serveBatch.workers needs at least one engine URL" (join "," .Values.serveBatch.workers) }}
+            - --engine
+            - {{ .Values.serveBatch.engine }}
+            - --concurrency
+            - {{ .Values.serveBatch.concurrency | quote }}
+            {{- if include "forge.apiKeySecretName" . }}
+            - --api-key
+            - $(FORGE_API_KEY)
+            {{- end }}
+            {{- range .Values.serveBatch.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if include "forge.apiKeySecretName" . }}
+          env:
+            - name: FORGE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "forge.apiKeySecretName" . }}
+                  key: {{ .Values.serveBatch.existingApiKeySecretKey }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.serveBatch.port }}
+          livenessProbe:
+            httpGet: { path: /v1/health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /v1/health, port: http }
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "forge.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

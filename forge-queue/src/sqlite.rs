@@ -131,6 +131,10 @@ impl SqliteQueue {
         )
         .map_err(q)?;
         conn.execute_batch(SCHEMA).map_err(q)?;
+        // Migration for checkpoints created before the job table carried the fleet
+        // config: adding a column that already exists is the only failure mode, so
+        // the error is deliberately ignored.
+        let _ = conn.execute("ALTER TABLE job ADD COLUMN concurrency INTEGER", []);
         Ok(Self::wrap(conn))
     }
 
@@ -138,6 +142,10 @@ impl SqliteQueue {
     pub fn open_in_memory() -> Result<Self, ForgeError> {
         let conn = Connection::open_in_memory().map_err(q)?;
         conn.execute_batch(SCHEMA).map_err(q)?;
+        // Migration for checkpoints created before the job table carried the fleet
+        // config: adding a column that already exists is the only failure mode, so
+        // the error is deliberately ignored.
+        let _ = conn.execute("ALTER TABLE job ADD COLUMN concurrency INTEGER", []);
         Ok(Self::wrap(conn))
     }
 
@@ -149,21 +157,45 @@ impl SqliteQueue {
     }
 
     /// Record this run's job metadata so a later `resume` can reuse the original
-    /// output path (the checkpoint holds one job; re-running replaces it). Called
-    /// once at startup — synchronous since it's off the dispatch hot path.
-    pub fn record_job(&self, input_uri: &str, output_uri: &str) -> Result<(), ForgeError> {
+    /// output path AND fleet config (the checkpoint holds one job; re-running
+    /// replaces it). Recording the per-worker concurrency closes a real footgun: a
+    /// bare `resume` used to silently fall back to the flag default, which against
+    /// a small engine meant starting AIMD at a far-too-high ceiling — a 429 storm
+    /// that dead-letters valid items. Called once at startup — synchronous since
+    /// it's off the dispatch hot path.
+    pub fn record_job(
+        &self,
+        input_uri: &str,
+        output_uri: &str,
+        concurrency: usize,
+    ) -> Result<(), ForgeError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO job (job_id, input_uri, output_uri, created_at, status)
-                 VALUES ('default', ?1, ?2, ?3, 'running')
+            "INSERT INTO job (job_id, input_uri, output_uri, concurrency, created_at, status)
+                 VALUES ('default', ?1, ?2, ?3, ?4, 'running')
              ON CONFLICT(job_id) DO UPDATE SET
                  input_uri = excluded.input_uri,
                  output_uri = excluded.output_uri,
+                 concurrency = excluded.concurrency,
                  created_at = excluded.created_at",
-            params![input_uri, output_uri, now_ms()],
+            params![input_uri, output_uri, concurrency as i64, now_ms()],
         )
         .map_err(q)?;
         Ok(())
+    }
+
+    /// The per-worker concurrency recorded by the original `run`, if this
+    /// checkpoint has one (`None` for checkpoints from older builds).
+    pub fn job_concurrency(&self) -> Result<Option<usize>, ForgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT concurrency FROM job WHERE job_id='default'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(q)
+        .map(|v| v.flatten().map(|c| c.max(1) as usize))
     }
 
     /// The output path recorded by the original `run`, if this checkpoint has one.
@@ -306,12 +338,13 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS idx_items_status ON items(status, leased_until);
 
 CREATE TABLE IF NOT EXISTS job (
-    job_id     TEXT PRIMARY KEY,
-    input_uri  TEXT,
-    output_uri TEXT,
-    model      TEXT,
-    created_at INTEGER,
-    status     TEXT NOT NULL DEFAULT 'running'
+    job_id      TEXT PRIMARY KEY,
+    input_uri   TEXT,
+    output_uri  TEXT,
+    model       TEXT,
+    concurrency INTEGER,
+    created_at  INTEGER,
+    status      TEXT NOT NULL DEFAULT 'running'
 );
 
 -- Line-range bookkeeping for seek-resume ONLY (never a dependency unit).
@@ -637,14 +670,17 @@ mod tests {
     }
 
     #[test]
-    fn job_output_uri_roundtrip() {
+    fn job_metadata_roundtrip() {
         let q = SqliteQueue::open_in_memory().unwrap();
         assert_eq!(q.job_output_uri().unwrap(), None);
-        q.record_job("in.jsonl", "out.jsonl").unwrap();
+        assert_eq!(q.job_concurrency().unwrap(), None);
+        q.record_job("in.jsonl", "out.jsonl", 8).unwrap();
         assert_eq!(q.job_output_uri().unwrap().as_deref(), Some("out.jsonl"));
-        // Re-running replaces it.
-        q.record_job("in.jsonl", "other.jsonl").unwrap();
+        assert_eq!(q.job_concurrency().unwrap(), Some(8));
+        // Re-running replaces both.
+        q.record_job("in.jsonl", "other.jsonl", 16).unwrap();
         assert_eq!(q.job_output_uri().unwrap().as_deref(), Some("other.jsonl"));
+        assert_eq!(q.job_concurrency().unwrap(), Some(16));
     }
 
     #[tokio::test]

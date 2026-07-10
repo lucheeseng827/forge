@@ -77,8 +77,11 @@ struct WorkerArgs {
     #[arg(long, value_enum, default_value_t = EndpointArg::Chat)]
     endpoint: EndpointArg,
     /// Per-worker in-flight cap (= the engine's max-num-seqs / --parallel).
-    #[arg(long, default_value_t = 256)]
-    concurrency: usize,
+    /// `run`/`serve-batch` default to 256 when omitted; `resume` defaults to the
+    /// value the original `run` recorded in the checkpoint, so a bare resume can
+    /// never restart AIMD at a ceiling the fleet was not configured for.
+    #[arg(long)]
+    concurrency: Option<usize>,
     /// Visibility-timeout floor in seconds before the reaper re-queues a lease.
     #[arg(long, default_value_t = 300)]
     lease_secs: u64,
@@ -353,25 +356,25 @@ impl WorkerArgs {
     /// The resolved [`WorkerSpec`]s (URLs + endpoint + concurrency + engine hint), used
     /// by `serve-batch`'s [`HttpFleet`] which rebuilds a fresh `HttpWorker` fleet per
     /// batch. Mirrors [`build_workers`](Self::build_workers) minus the client construction.
-    fn worker_specs(&self) -> Vec<WorkerSpec> {
+    fn worker_specs(&self, concurrency: usize) -> Vec<WorkerSpec> {
         self.workers
             .iter()
             .enumerate()
             .map(|(i, url)| {
                 WorkerSpec::new(format!("w{i}"), url.clone(), self.endpoint.into())
-                    .concurrency(self.concurrency)
+                    .concurrency(concurrency)
                     .engine_hint(self.engine.into())
             })
             .collect()
     }
 
-    fn build_workers(&self) -> anyhow::Result<Vec<HttpWorker>> {
+    fn build_workers(&self, concurrency: usize) -> anyhow::Result<Vec<HttpWorker>> {
         self.workers
             .iter()
             .enumerate()
             .map(|(i, url)| {
                 let spec = WorkerSpec::new(format!("w{i}"), url.clone(), self.endpoint.into())
-                    .concurrency(self.concurrency)
+                    .concurrency(concurrency)
                     .engine_hint(self.engine.into());
                 HttpWorker::new(spec)
                     .map(|w| {
@@ -426,7 +429,8 @@ async fn cmd_serve_batch(a: ServeBatchArgs) -> anyhow::Result<()> {
         anyhow::bail!("serve-batch needs at least one --workers endpoint for the fleet");
     }
     let fleet = HttpFleet::new(
-        a.workers.worker_specs(),
+        a.workers
+            .worker_specs(a.workers.concurrency.unwrap_or(DEFAULT_CONCURRENCY)),
         a.workers.retry_policy(),
         a.workers.require.into(),
     );
@@ -483,9 +487,12 @@ async fn cmd_run(a: RunArgs) -> anyhow::Result<()> {
     ensure_object_store_build(&out, object_out)?;
 
     let queue = SqliteQueue::open(&a.checkpoint)?;
-    // Record the output path (URL or local) so `resume` reuses it (avoids a split export).
+    let concurrency = a.workers.concurrency.unwrap_or(DEFAULT_CONCURRENCY);
+    // Record the output path (URL or local) AND the fleet's per-worker concurrency
+    // so `resume` reuses both (avoids a split export, and a bare resume can never
+    // restart AIMD at a ceiling the fleet was not configured for).
     queue
-        .record_job(&a.input.to_string_lossy(), &out)
+        .record_job(&a.input.to_string_lossy(), &out, concurrency)
         .context("recording job metadata")?;
     // Rejected (malformed / invalid custom_id) lines are preserved for repair: beside
     // the results for a local run, or beside the checkpoint when results go to a remote
@@ -530,7 +537,7 @@ async fn cmd_run(a: RunArgs) -> anyhow::Result<()> {
         );
     }
 
-    let workers = a.workers.build_workers()?;
+    let workers = a.workers.build_workers(concurrency)?;
     let cfg = a.workers.run_config();
     let totals = if object_out {
         run_into_object_store(&out, &object_job_id(&a.checkpoint), queue, workers, cfg).await?
@@ -692,6 +699,46 @@ async fn object_verify(
     anyhow::bail!("object-store results ({results}) need `--features object_store`")
 }
 
+/// The per-worker in-flight cap used when neither a flag nor recorded job
+/// metadata supplies one.
+const DEFAULT_CONCURRENCY: usize = 256;
+
+/// Pick the per-worker concurrency for a resume. An explicit `--concurrency` wins
+/// (the fleet may genuinely have changed), with a warning when it diverges from
+/// what the original `run` recorded; otherwise the recorded value is reused. Only
+/// a checkpoint from an older build (no recorded value) falls back to the flag
+/// default — loudly, because restarting AIMD at a ceiling the fleet was never
+/// configured for is how valid items end up dead-lettered in a 429 storm.
+fn resolve_resume_concurrency(
+    queue: &SqliteQueue,
+    supplied: Option<usize>,
+) -> anyhow::Result<usize> {
+    let recorded = queue
+        .job_concurrency()
+        .context("reading recorded job metadata")?;
+    Ok(match (supplied, recorded) {
+        (Some(s), Some(r)) => {
+            if s != r {
+                tracing::warn!(
+                    supplied = s,
+                    recorded = r,
+                    "overriding the checkpoint's recorded --concurrency"
+                );
+            }
+            s
+        }
+        (Some(s), None) => s,
+        (None, Some(r)) => r,
+        (None, None) => {
+            tracing::warn!(
+                default = DEFAULT_CONCURRENCY,
+                "checkpoint has no recorded concurrency (older build); using the default — pass --concurrency to match your fleet"
+            );
+            DEFAULT_CONCURRENCY
+        }
+    })
+}
+
 /// Pick the results file for a resume: prefer the path the original `run` recorded
 /// in the checkpoint; fall back to `--out` only for older checkpoints without it.
 fn resolve_resume_out(queue: &SqliteQueue, supplied: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -727,7 +774,8 @@ async fn cmd_resume(a: ResumeArgs) -> anyhow::Result<()> {
     let object_out = is_object_url(&out_str);
     ensure_object_store_build(&out_str, object_out)?;
 
-    let workers = a.workers.build_workers()?;
+    let concurrency = resolve_resume_concurrency(&queue, a.workers.concurrency)?;
+    let workers = a.workers.build_workers(concurrency)?;
     let cfg = a.workers.run_config();
     let totals = if object_out {
         run_into_object_store(&out_str, &object_job_id(&a.checkpoint), queue, workers, cfg).await?
@@ -1127,4 +1175,27 @@ async fn cmd_verify(a: VerifyArgs) -> anyhow::Result<()> {
         anyhow::bail!("{} input id(s) have no terminal result", report.missing);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_concurrency_prefers_recorded_then_flag_then_default() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+
+        // Older checkpoint (no recorded value): flag wins, else the loud default.
+        assert_eq!(resolve_resume_concurrency(&q, Some(4)).unwrap(), 4);
+        assert_eq!(
+            resolve_resume_concurrency(&q, None).unwrap(),
+            DEFAULT_CONCURRENCY
+        );
+
+        // A run recorded its fleet config: a bare resume reuses it...
+        q.record_job("in.jsonl", "out.jsonl", 8).unwrap();
+        assert_eq!(resolve_resume_concurrency(&q, None).unwrap(), 8);
+        // ...and an explicit flag still wins (fleet may have changed), warned.
+        assert_eq!(resolve_resume_concurrency(&q, Some(16)).unwrap(), 16);
+    }
 }
