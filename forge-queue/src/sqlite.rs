@@ -107,6 +107,47 @@ fn resume_audit_locked(conn: &Connection, now_ms: i64) -> Result<ResumeAudit, Fo
     })
 }
 
+/// Take a **consistent** copy of a checkpoint DB that another process may be writing.
+///
+/// A backup of this file cannot be `cp`. The queue runs in WAL mode, so the committed
+/// state at any instant is spread across `state.db`, `state.db-wal` and `state.db-shm`;
+/// copying them with three separate reads, in any order, can capture a torn set —
+/// committed items missing, or a WAL that refers to pages the copied `.db` does not
+/// have. The failure is silent: the copy opens fine and is simply missing work.
+///
+/// `VACUUM INTO` runs inside a read transaction, so it writes a single self-contained
+/// file holding exactly the state committed when it started. Writers are not blocked,
+/// which is what makes an online backup of a live intake root possible at all.
+///
+/// The destination must not exist — SQLite refuses to overwrite, and so do we: a backup
+/// that silently replaces yesterday's is not a backup.
+pub fn snapshot_db(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result<(), ForgeError> {
+    let (src, dest) = (src.as_ref(), dest.as_ref());
+    if dest.exists() {
+        return Err(ForgeError::Config(format!(
+            "refusing to overwrite an existing snapshot at {}",
+            dest.display()
+        )));
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    // Read-only: a backup must never be able to modify what it is backing up, and
+    // opening read-write would create an empty DB if `src` were mistyped.
+    let conn =
+        Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(q)?;
+    conn.busy_timeout(std::time::Duration::from_secs(60))
+        .map_err(q)?;
+    // The path goes in as a bound parameter, not formatted into the SQL — a job
+    // directory is operator-controlled, but quoting a path into a statement is a habit
+    // worth not having.
+    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])
+        .map_err(q)?;
+    Ok(())
+}
+
 impl SqliteQueue {
     /// Open (creating if needed) the checkpoint DB at `path`, apply the
     /// crash-safety pragmas, and ensure the schema exists. This is the durable
@@ -135,6 +176,7 @@ impl SqliteQueue {
         // config: adding a column that already exists is the only failure mode, so
         // the error is deliberately ignored.
         let _ = conn.execute("ALTER TABLE job ADD COLUMN concurrency INTEGER", []);
+        check_and_stamp_version(&conn)?;
         Ok(Self::wrap(conn))
     }
 
@@ -146,6 +188,7 @@ impl SqliteQueue {
         // config: adding a column that already exists is the only failure mode, so
         // the error is deliberately ignored.
         let _ = conn.execute("ALTER TABLE job ADD COLUMN concurrency INTEGER", []);
+        check_and_stamp_version(&conn)?;
         Ok(Self::wrap(conn))
     }
 
@@ -280,6 +323,88 @@ impl SqliteQueue {
         .map_err(join_err)?
     }
 
+    /// Every dead-lettered item, as `(custom_id, last_error)`, in insertion order.
+    ///
+    /// Inherent rather than on the [`Queue`] trait, matching
+    /// [`failure_breakdown`](Self::failure_breakdown) and
+    /// [`attempt_histogram`](Self::attempt_histogram): a leaner backend need not carry
+    /// a requeue path to be a correct queue.
+    pub async fn dead_letters(&self) -> Result<Vec<(String, Option<String>)>, ForgeError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, Option<String>)>, ForgeError> {
+                let conn = conn.lock().unwrap();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT custom_id, last_error FROM items
+                      WHERE status = 'dead_letter' ORDER BY rowid",
+                    )
+                    .map_err(q)?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(q)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(q)
+            },
+        )
+        .await
+        .map_err(join_err)?
+    }
+
+    /// `DeadLetter → Pending` for `ids`, returning the ids actually transitioned.
+    ///
+    /// **The retry budget is reset with the state.** `attempts` is what
+    /// [`Queue::lease`] increments and what the run loop compares against
+    /// `--max-attempts`, so a requeued item that kept its exhausted count would be
+    /// leased once and dead-letter again immediately — a requeue that looks like it
+    /// worked and changes nothing. `last_error` is cleared for the same reason: it
+    /// describes a run that is no longer this item's latest.
+    ///
+    /// **Only `dead_letter` rows move.** A `done` item is never resurrected (its
+    /// result is already emitted and billed), and a `pending`/`leased` item is not
+    /// touched by an operator's stale id list. The returned set is the honest answer
+    /// to "what did this actually do", which the caller reconciles against the store.
+    ///
+    /// Idempotent: a second call for the same ids transitions nothing and returns
+    /// empty.
+    pub async fn requeue_dead(&self, ids: &[String]) -> Result<Vec<String>, ForgeError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = Arc::clone(&self.conn);
+        let ids = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, ForgeError> {
+            let mut guard = conn.lock().unwrap();
+            // One transaction: either every listed item is runnable again or none is,
+            // so a crash cannot leave an operator reconciling a half-applied requeue
+            // against a dead-letter file that was already pruned.
+            let tx = guard.transaction().map_err(q)?;
+            let mut moved = Vec::new();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "UPDATE items
+                            SET status='pending', attempts=0, last_error=NULL,
+                                leased_until=NULL, leased_by=NULL
+                          WHERE custom_id=?1 AND status='dead_letter'
+                      RETURNING custom_id",
+                    )
+                    .map_err(q)?;
+                for id in &ids {
+                    let mut rows = stmt.query(params![id]).map_err(q)?;
+                    if let Some(row) = rows.next().map_err(q)? {
+                        moved.push(row.get::<_, String>(0).map_err(q)?);
+                    }
+                }
+            }
+            tx.commit().map_err(q)?;
+            Ok(moved)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
     /// Breakdown of dead-lettered items by classified failure reason
     /// ([`classify_failure`](forge_core::classify_failure)), as `(reason, count)`
     /// most-common first — the "what's failing" signal for `forge status`. Scans only
@@ -322,6 +447,88 @@ impl SqliteQueue {
     }
 }
 
+/// The checkpoint layout this binary reads and writes.
+///
+/// **Version 1 is the layout that already existed.** Checkpoints written before this
+/// field existed carry no version row, and are stamped `1` on first open rather than
+/// migrated — because they *are* version 1; nothing about their tables changed. The
+/// point of recording it is forward: a future layout change can now be detected
+/// instead of silently misread, and this binary refuses a checkpoint written by a
+/// newer forge rather than interpreting its tables under the old meaning.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+
+/// The `meta` key carrying [`CHECKPOINT_SCHEMA_VERSION`].
+const META_SCHEMA_VERSION: &str = "schema_version";
+/// Provenance: which forge wrote (or last opened) this checkpoint. Never read by the
+/// code — it is here for the operator reading a support ticket.
+const META_FORGE_VERSION: &str = "forge_version";
+
+/// Read the recorded schema version, refuse a newer one, and stamp an unversioned
+/// checkpoint with the current version.
+///
+/// Refusing is the entire feature. A checkpoint whose `items` table means something
+/// different is one this binary would happily lease from, ack into, and bill — the
+/// failure mode a version check exists to convert into a message.
+fn check_and_stamp_version(conn: &Connection) -> Result<(), ForgeError> {
+    let recorded: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![META_SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(q)?;
+
+    match recorded.as_deref().map(str::parse::<u32>) {
+        Some(Ok(v)) if v > CHECKPOINT_SCHEMA_VERSION => {
+            return Err(ForgeError::Store(format!(
+                "checkpoint was written by a newer forge (checkpoint schema v{v}, this \
+                 binary reads v{}). Reading it under the old layout could lease, ack or \
+                 bill items that no longer mean what this binary thinks they mean. \
+                 Upgrade forge, or start a fresh checkpoint.",
+                CHECKPOINT_SCHEMA_VERSION
+            )));
+        }
+        Some(Ok(v)) if v < CHECKPOINT_SCHEMA_VERSION => {
+            // No older version exists yet, so this arm cannot fire today. It is here so
+            // that when one does, the seam is a named refusal with a remedy rather than
+            // a silent misread — the same reason the newer-version arm exists.
+            return Err(ForgeError::Store(format!(
+                "checkpoint uses schema v{v}, this binary reads v{}, and no migration \
+                 from v{v} exists. Finish the job with the forge that wrote it, or start \
+                 a fresh checkpoint.",
+                CHECKPOINT_SCHEMA_VERSION
+            )));
+        }
+        Some(Ok(_)) => {}
+        Some(Err(_)) => {
+            let raw = recorded.unwrap_or_default();
+            return Err(ForgeError::Store(format!(
+                "checkpoint records an unreadable schema version {raw:?}. This file was \
+                 not written by forge, or was edited by hand; refusing to interpret its \
+                 tables."
+            )));
+        }
+        // Unversioned: a checkpoint from before the version was recorded. It IS v1 —
+        // no table changed — so stamp it rather than refuse a working job.
+        None => {}
+    }
+
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_SCHEMA_VERSION, CHECKPOINT_SCHEMA_VERSION.to_string()],
+    )
+    .map_err(q)?;
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_FORGE_VERSION, env!("CARGO_PKG_VERSION")],
+    )
+    .map_err(q)?;
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS items (
     custom_id    TEXT PRIMARY KEY,
@@ -345,6 +552,12 @@ CREATE TABLE IF NOT EXISTS job (
     concurrency INTEGER,
     created_at  INTEGER,
     status      TEXT NOT NULL DEFAULT 'running'
+);
+
+-- Checkpoint format identity. See `CHECKPOINT_SCHEMA_VERSION`.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- Line-range bookkeeping for seek-resume ONLY (never a dependency unit).
@@ -769,6 +982,216 @@ mod tests {
         assert_eq!(audit.live_leases, 1);
         assert_eq!(audit.orphaned_leases, 1);
         assert_eq!(counts.pending, 1);
+    }
+
+    #[test]
+    fn a_pre_versioning_checkpoint_is_stamped_not_refused() {
+        // Version 1 IS the layout those files already have — nothing about their tables
+        // changed — so a working job must not be broken by the introduction of a version
+        // field. Recording it protects the NEXT layout change.
+        let dir = std::env::temp_dir().join(format!("forge-ckpt-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+
+        // A checkpoint as an older forge left it: real tables, real rows, no meta table.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (custom_id TEXT PRIMARY KEY, method TEXT NOT NULL DEFAULT 'POST',
+                     url TEXT NOT NULL DEFAULT '', body TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                     leased_until INTEGER, leased_by TEXT, last_error TEXT);
+                 INSERT INTO items (custom_id, body) VALUES ('a', '{}');",
+            )
+            .unwrap();
+        }
+        let q = SqliteQueue::open(&path).expect("a pre-versioning checkpoint must still open");
+        {
+            let conn = q.connection().lock().unwrap();
+            let v: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(v, CHECKPOINT_SCHEMA_VERSION.to_string());
+            let n: i64 = conn
+                .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "the operator's in-flight work is untouched");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_checkpoint_from_a_newer_forge_is_refused_by_name() {
+        // The failure this exists to prevent: leasing, acking and BILLING items out of
+        // a table whose columns no longer mean what this binary thinks they mean.
+        let dir = std::env::temp_dir().join(format!("forge-ckpt-newer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        SqliteQueue::open(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key='schema_version'",
+                params![(CHECKPOINT_SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        }
+        let err = match SqliteQueue::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a newer checkpoint must not open"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("newer forge"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("Upgrade forge"),
+            "must state the remedy: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_schema_version_is_refused_rather_than_assumed() {
+        let dir = std::env::temp_dir().join(format!("forge-ckpt-junk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        SqliteQueue::open(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE meta SET value='banana' WHERE key='schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        let err = match SqliteQueue::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("junk must not be read as a version"),
+        };
+        assert!(
+            err.to_string().contains("unreadable schema version"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_a_versioned_checkpoint_is_a_no_op() {
+        let dir = std::env::temp_dir().join(format!("forge-ckpt-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        for _ in 0..3 {
+            SqliteQueue::open(&path).expect("reopening must stay clean");
+        }
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the version row is upserted, never duplicated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn requeue_dead_makes_items_runnable_again_with_a_fresh_retry_budget() {
+        // A requeued item that kept its exhausted `attempts` would be leased once and
+        // dead-letter again immediately — a requeue that looks like it worked and
+        // changes nothing.
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(&[item("a"), item("b"), item("c")]).await.unwrap();
+        let leased = q.lease(3, Duration::from_secs(60)).await.unwrap();
+        for it in &leased {
+            q.dead_letter(&it.custom_id, it.attempts, "retries exhausted: HTTP 500")
+                .await
+                .unwrap();
+        }
+        assert_eq!(q.counts().await.unwrap().dead, 3);
+
+        let moved = q
+            .requeue_dead(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(moved.len(), 2);
+        let c = q.counts().await.unwrap();
+        assert_eq!(c.pending, 2);
+        assert_eq!(c.dead, 1, "the unlisted item stays quarantined");
+
+        // The retry budget really is fresh, and the stale error is gone.
+        let again = q.lease(2, Duration::from_secs(60)).await.unwrap();
+        assert_eq!(again.len(), 2);
+        for it in &again {
+            assert_eq!(it.attempts, 1, "first attempt of a new budget, not the 4th");
+            assert!(it.last_error.is_none(), "the stale error must not survive");
+        }
+    }
+
+    #[tokio::test]
+    async fn requeue_dead_moves_only_dead_rows_and_is_idempotent() {
+        // An operator's id list is often stale — copied from an older dead file, or a
+        // superset. Resurrecting a `done` item would re-run work already emitted and
+        // billed; disturbing a `leased` one would fight the coordinator.
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(&[item("done1"), item("dead1"), item("pending1")])
+            .await
+            .unwrap();
+        let leased = q.lease(2, Duration::from_secs(60)).await.unwrap();
+        for it in &leased {
+            if it.custom_id == "done1" {
+                q.ack(&it.custom_id, it.attempts).await.unwrap();
+            } else {
+                q.dead_letter(&it.custom_id, it.attempts, "boom")
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let moved = q
+            .requeue_dead(&[
+                "done1".to_string(),
+                "dead1".to_string(),
+                "pending1".to_string(),
+                "ghost".to_string(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(moved, vec!["dead1".to_string()], "only the dead row moves");
+        let c = q.counts().await.unwrap();
+        assert_eq!(c.done, 1, "a done item is never resurrected");
+        assert_eq!(c.dead, 0);
+        assert_eq!(c.pending, 2, "pending1 untouched + dead1 requeued");
+
+        // Idempotent.
+        let twice = q.requeue_dead(&["dead1".to_string()]).await.unwrap();
+        assert!(twice.is_empty(), "a second requeue transitions nothing");
+    }
+
+    #[tokio::test]
+    async fn dead_letters_lists_ids_with_their_recorded_error() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(&[item("x"), item("y")]).await.unwrap();
+        let leased = q.lease(2, Duration::from_secs(60)).await.unwrap();
+        for it in &leased {
+            q.dead_letter(&it.custom_id, it.attempts, "retries exhausted: timeout")
+                .await
+                .unwrap();
+        }
+        let listed = q.dead_letters().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .all(|(_, e)| e.as_deref() == Some("retries exhausted: timeout")));
+        let ids: Vec<&str> = listed.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(ids, vec!["x", "y"]);
     }
 
     #[tokio::test]

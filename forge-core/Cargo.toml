@@ -13,5 +13,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# `init_logging` lives here so the OSS CLI and the ee control plane install the SAME
+# subscriber — one place decides how a forge process logs.
+tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 futures-util = { workspace = true }

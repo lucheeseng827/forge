@@ -18,9 +18,11 @@
 // `async fn` desugaring is fine; silence the forward-compat lint deliberately.
 #![allow(async_fn_in_trait)]
 
+pub mod build;
 mod cost;
 mod error;
 mod failure;
+pub mod obs;
 mod retry;
 mod run;
 mod state;
@@ -28,16 +30,20 @@ mod traits;
 mod types;
 mod validate;
 
+pub use build::{identity as build_identity, init_logging, LogFormat};
 pub use cost::{compute_cost, CostInputs, CostReport, UsageTotals};
 pub use error::ForgeError;
 pub use failure::{classify_failure, FailureKind};
+pub use obs::{
+    accept_request_id, current_request_id, internal_error_body, mint_request_id, scope_request_id,
+};
 pub use retry::RetryPolicy;
 pub use run::{BatchRun, RunConfig};
 pub use state::ItemState;
 pub use traits::{Queue, QueueCounts, ResultStore, Worker};
 pub use types::{
-    EndpointKind, EngineHint, Item, ItemError, ItemResponse, ItemResult, Job, JobStatus, JobTotals,
-    Shard, TokenUsage, WorkerSpec,
+    valid_item_url, EndpointKind, EngineHint, Item, ItemError, ItemResponse, ItemResult, Job,
+    JobStatus, JobTotals, Shard, TokenUsage, WorkerSpec, MAX_ITEM_URL_LEN,
 };
 pub use validate::ResponseCheck;
 

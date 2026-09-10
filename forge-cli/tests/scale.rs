@@ -232,6 +232,7 @@ async fn fan_out_at_scale_completes() {
         ready_grace: Duration::from_secs(5),
         retry: Default::default(),
         load_aware: true,
+        ..RunConfig::default()
     };
 
     let started = Instant::now();

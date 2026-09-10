@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::state::ItemState;
+use crate::ForgeError;
 
 /// Which OpenAI-compatible endpoint a worker serves. Every item in one run hits
 /// the same kind of endpoint — there is no per-item "task type" that branches
@@ -105,8 +106,10 @@ impl EngineHint {
 }
 
 /// Per-request token accounting, captured free from every OpenAI-compatible
-/// `usage` object. llama.cpp's native `tokens_evaluated`/`tokens_predicted` map
-/// into the same shape. The invoiceable tokens-per-spot-dollar metric.
+/// `usage` object. llama.cpp's native `tokens_evaluated`/`tokens_predicted` map into
+/// the same shape — including when the engine reports them at the top level of the
+/// response with no `usage` object at all, which is what its native completion route
+/// does. The invoiceable tokens-per-spot-dollar metric.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     #[serde(default)]
@@ -141,10 +144,31 @@ impl TokenUsage {
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0)
         };
+        // llama.cpp's native completion route reports `tokens_evaluated` /
+        // `tokens_predicted` instead of the OpenAI names — and reports them at the TOP
+        // LEVEL of the response, not inside a `usage` object. Both were documented as
+        // supported and neither was read, so a llama.cpp run recorded ZERO tokens and
+        // silently zeroed the cost ledger: the invoiceable metric this product is sold
+        // on. Purely additive — when the OpenAI names are present they win, so no
+        // existing provider's parse changes.
+        let prompt = match get("prompt_tokens") {
+            0 => get("tokens_evaluated"),
+            n => n,
+        };
+        let completion = match get("completion_tokens") {
+            0 => get("tokens_predicted"),
+            n => n,
+        };
+        // llama.cpp reports no total; derive it rather than reporting zero, the same way
+        // `from_anthropic_usage` derives Anthropic's missing total.
+        let total = match get("total_tokens") {
+            0 => prompt + completion,
+            n => n,
+        };
         TokenUsage {
-            prompt_tokens: get("prompt_tokens"),
-            completion_tokens: get("completion_tokens"),
-            total_tokens: get("total_tokens"),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
             cached_tokens: nested("prompt_tokens_details", "cached_tokens"),
             reasoning_tokens: nested("completion_tokens_details", "reasoning_tokens"),
         }
@@ -250,15 +274,90 @@ impl WorkerSpec {
 
     /// The full request URL for this worker, given the item's `url` (or the
     /// endpoint default when the item left it blank).
-    pub fn request_url(&self, item_url: &str) -> String {
+    ///
+    /// **Security boundary.** `item_url` is caller-supplied data — it arrives from a
+    /// tenant's JSONL line or off the (unauthenticated) coordinator wire — and it is
+    /// concatenated onto an operator-controlled `base_url`. Concatenating an
+    /// unvalidated value here is how a request gets re-hosted: because `@` separates
+    /// userinfo from host in a URL authority, an `item_url` of
+    /// `@attacker.example.com/v1/chat/completions` would turn
+    /// `http://gpu1:8000` into `http://gpu1:8000@attacker.example.com/...` — host
+    /// `attacker.example.com`, with the prompt body *and* the worker's
+    /// `Authorization` header (a `reqwest` default header, attached regardless of
+    /// host) going with it. [`valid_item_url`] is therefore enforced HERE, at the one
+    /// place every dispatch path funnels through, and not only at ingest — an item
+    /// that reached the queue by some other route still cannot escape the fleet.
+    pub fn request_url(&self, item_url: &str) -> Result<String, ForgeError> {
+        if !valid_item_url(item_url) {
+            return Err(ForgeError::Worker(format!(
+                "refusing to dispatch: invalid item url {item_url:?} \
+                 (expected empty, or an absolute path like \"/v1/chat/completions\")"
+            )));
+        }
         let path = if item_url.is_empty() {
             self.endpoint_kind.default_path()
         } else {
             item_url
         };
-        format!("{}{}", self.base_url.trim_end_matches('/'), path)
+        Ok(format!("{}{}", self.base_url.trim_end_matches('/'), path))
     }
 }
+
+/// The charset for an [`Item`]'s `url`: empty (use the worker's endpoint default), or
+/// an **absolute path** — the shape every documented example and every closed Batch
+/// API file already uses (`/v1/chat/completions`, `/v1/embeddings`).
+///
+/// The load-bearing rule is the leading `/`: it forces the value into the *path*
+/// component, after the authority has already been fixed by `base_url`, which is what
+/// makes re-hosting impossible. The rest is defence in depth against URL-parser
+/// differentials:
+///
+/// - a leading `//` would be a protocol-relative reference to some parsers;
+/// - `@` cannot reach the authority once a `/` leads, but it is banned anyway — no
+///   LLM API path carries one, so the cost of refusing it is nil;
+/// - `\` is treated as `/` by several parsers (and by Windows path logic);
+/// - control bytes (`\r`, `\n`, NUL, …) are request-smuggling and log-injection
+///   material.
+///
+/// Dot segments are refused, in literal (`..`) and percent-encoded (`%2e`) form. They
+/// cannot change the *host* — the URL crate normalises `/../../v1/admin` back to
+/// `/v1/admin` on the same authority — but they do let one item reach a different
+/// endpoint than the run was configured for, which matters when `base_url` carries a
+/// path prefix (a router, or a per-tenant gateway path). Both forms must be checked:
+/// `url` decodes `%2e` to `.` before collapsing segments, so testing text alone lets
+/// `/%2e%2e/` through. No real LLM API path contains either form.
+///
+/// A `:` is deliberately **allowed**: with a leading `/` it cannot form a scheme, and
+/// Google-style action paths (`/v1/models/foo:predict`) are legitimate on
+/// OpenAI-compatible gateways.
+pub fn valid_item_url(url: &str) -> bool {
+    if url.is_empty() {
+        return true;
+    }
+    if url.len() > MAX_ITEM_URL_LEN {
+        return false;
+    }
+    if !url.starts_with('/') || url.starts_with("//") {
+        return false;
+    }
+    // Dot segments, literal AND percent-encoded. The `url` crate decodes `%2e` to `.`
+    // BEFORE it collapses path segments, so a purely textual `..` test is defeated by
+    // `/%2e%2e/` (verified end-to-end against reqwest). No real LLM API path
+    // percent-encodes a dot, so the cheapest correct rule is to refuse the escape
+    // sequence outright and then test segments literally.
+    if url.to_ascii_lowercase().contains("%2e") {
+        return false;
+    }
+    if url.split(['/', '?', '#']).any(|seg| seg == "..") {
+        return false;
+    }
+    !url.bytes()
+        .any(|b| b == b'@' || b == b'\\' || b.is_ascii_control())
+}
+
+/// Upper bound on an item `url`, so a pathological line cannot bloat a log line or a
+/// dead-letter record. Far above any real API path.
+pub const MAX_ITEM_URL_LEN: usize = 2048;
 
 fn default_method() -> String {
     "POST".to_string()
@@ -445,11 +544,84 @@ mod tests {
     fn worker_request_url_uses_endpoint_default_when_blank() {
         let w = WorkerSpec::new("gpu1", "http://gpu1:8000/", EndpointKind::Chat).concurrency(128);
         assert_eq!(w.concurrency_limit, 128);
-        assert_eq!(w.request_url(""), "http://gpu1:8000/v1/chat/completions");
         assert_eq!(
-            w.request_url("/v1/embeddings"),
+            w.request_url("").unwrap(),
+            "http://gpu1:8000/v1/chat/completions"
+        );
+        assert_eq!(
+            w.request_url("/v1/embeddings").unwrap(),
             "http://gpu1:8000/v1/embeddings"
         );
+    }
+
+    #[test]
+    fn request_url_refuses_to_rehost_the_request() {
+        let w = WorkerSpec::new("gpu1", "http://gpu1:8000", EndpointKind::Chat);
+
+        // The exploit this guard exists for: with no leading `/`, the value lands in
+        // the URL *authority*, `@` splits off `gpu1:8000` as userinfo, and the real
+        // host becomes attacker.example.com — carrying the prompt body and the
+        // worker's Authorization header with it.
+        let hostile = "@attacker.example.com/v1/chat/completions";
+        assert!(!valid_item_url(hostile));
+        assert!(w.request_url(hostile).is_err());
+        // Prove the concatenation really would have re-hosted it, so this test still
+        // fails loudly if someone "simplifies" the guard away.
+        let would_have_been = format!("{}{}", "http://gpu1:8000", hostile);
+        assert_eq!(
+            would_have_been,
+            "http://gpu1:8000@attacker.example.com/v1/chat/completions"
+        );
+
+        for hostile in [
+            "@evil.com/x",                     // userinfo split
+            "//evil.com/v1/chat/completions",  // protocol-relative
+            "\\evil.com/x",                    // backslash-as-slash parsers
+            "https://evil.com/v1/completions", // absolute URL
+            "v1/chat/completions",             // relative — no leading slash
+            "/v1/chat\r\nX-Injected: 1",       // header/request smuggling
+            "/v1/chat\u{0}completions",        // NUL
+            "/../../../v1/admin",              // literal dot-segments
+            "/v1/../admin",
+            // Percent-encoded dot segments: `url` decodes %2e BEFORE collapsing
+            // segments, so these reach a different endpoint despite carrying no
+            // literal "..". (A previous "/v1/..%2fadmin/.." case here passed only
+            // because of its TRAILING literal "..": %2f is never decoded into a
+            // separator, so it proved nothing about encoding.)
+            "/%2e%2e/x",
+            "/%2E%2E/x",
+            "/%2e./x",
+            "/.%2e/x",
+        ] {
+            assert!(!valid_item_url(hostile), "should reject {hostile:?}");
+            assert!(
+                w.request_url(hostile).is_err(),
+                "should refuse to dispatch {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_item_url_still_accepts_every_documented_shape() {
+        for ok in [
+            "", // endpoint default
+            "/v1/chat/completions",
+            "/v1/embeddings",
+            "/v1/messages",
+            "/v1/completions",
+            "/v1/models/gemini-pro:generateContent", // `:` is legal in a path
+            "/v1/chat/completions?stream=false",     // query strings stay on-host
+        ] {
+            assert!(valid_item_url(ok), "should accept {ok:?}");
+        }
+
+        // Length is capped, but far above any real path.
+        let long = format!("/{}", "a".repeat(MAX_ITEM_URL_LEN));
+        assert!(!valid_item_url(&long));
+        assert!(valid_item_url(&format!(
+            "/{}",
+            "a".repeat(MAX_ITEM_URL_LEN - 1)
+        )));
     }
 
     #[test]
@@ -521,5 +693,38 @@ mod tests {
         });
         assert_eq!(t.items_done, 2);
         assert_eq!(t.tokens_total(), 20);
+    }
+    #[test]
+    fn llamacpp_native_token_names_are_captured() {
+        // The bug: types.rs documented these as mapping "into the same shape" and
+        // from_openai_usage read neither, so a llama.cpp run billed zero tokens.
+        let u = TokenUsage::from_openai_usage(&serde_json::json!({
+            "tokens_evaluated": 120,
+            "tokens_predicted": 30,
+        }));
+        assert_eq!(u.prompt_tokens, 120);
+        assert_eq!(u.completion_tokens, 30);
+        // llama.cpp reports no total — deriving it beats invoicing zero.
+        assert_eq!(u.total_tokens, 150);
+    }
+
+    #[test]
+    fn openai_names_win_when_both_are_present() {
+        // Additive only: no existing provider's parse may change.
+        let u = TokenUsage::from_openai_usage(&serde_json::json!({
+            "prompt_tokens": 7,
+            "completion_tokens": 9,
+            "total_tokens": 16,
+            "tokens_evaluated": 999,
+            "tokens_predicted": 999,
+        }));
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            (7, 9, 16)
+        );
+
+        // And a body with no counts anywhere is still all zeros, as before.
+        let empty = TokenUsage::from_openai_usage(&serde_json::json!({"choices": []}));
+        assert_eq!(empty, TokenUsage::default());
     }
 }

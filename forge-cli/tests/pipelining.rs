@@ -113,6 +113,7 @@ async fn slow_worker_does_not_gate_the_fleet() {
         // No load metric on these doubles → exact round-robin assignment, the
         // worst case for head-of-line blocking.
         load_aware: true,
+        ..RunConfig::default()
     };
     let totals = BatchRun::new(queue, vec![fast, slow], store)
         .with_config(cfg)

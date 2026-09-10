@@ -9,6 +9,45 @@ inference and never provisions instances; your engines stay where they are.
 
 Source, docs, benchmarks: <https://github.com/lucheeseng827/forge> (Apache-2.0)
 
+## Where it fits
+
+`forge` is the **coordinator** between the jobs you submit and the engines that
+run them: it owns the work queue, sharding, lease/retry, checkpoint, and result
+aggregation — and nothing else. It never runs inference and never provisions
+GPUs; your engines stay where they are, and the boxes on the right are yours.
+
+```
+   CLIENTS                   FORGE                      WORKER FLEET
+   (submit a batch)          (this image)               (run the inference)
+
+ ┌──────────────┐
+ │ OpenAI SDK   │  /v1/files · /v1/batches ─┐
+ │ (serve-batch)│                           │
+ └──────────────┘                           │    ┌──────────────┐    ┌──────────────────┐
+ ┌──────────────┐                           │    │  forge       │    │ vLLM / SGLang    │
+ │ forge CLI    │  run·resume·verify·cost ──┼──▶ │  queue·lease │──▶ │ llama.cpp/Ollama │
+ │ (JSONL)      │                           │    │  retry·ckpt  │ ◀──│ (your spot GPUs) │
+ └──────────────┘                           │    │  aggregate   │    └──────────────────┘
+ ┌──────────────┐        ┌──────────────┐   │    └──────┬───────┘    ┌──────────────────┐
+ │ your app     │  ────▶ │  forge-core  │ ◀─┘           │       ───▶ │ …or hosted APIs  │
+ │ (embed lib)  │        │  fan-out     │               │            │ OpenAI·Anthropic │
+ └──────────────┘        └──────────────┘               │            └──────────────────┘
+                                                         │  OpenAI-compatible HTTP
+                          results.jsonl + dead-letter  ◀─┤
+                          checkpoint state.db (SQLite/redb)  ·  or S3/GCS/Azure results
+```
+
+- **Upstream** — whoever submits work: unmodified OpenAI-SDK code against the
+  `serve-batch` REST front door (`/v1/files`, `/v1/batches`), the `forge` CLI on a
+  JSONL of OpenAI Batch-format requests, or an app embedding `forge-core`. forge
+  takes a batch, not a connection.
+- **forge** — one static binary: shards the input into a durable queue, leases
+  items to workers, retries/dead-letters, checkpoints every result by `custom_id`,
+  and aggregates — so a kill or spot-eviction resumes with zero double-work.
+- **Downstream** — any OpenAI-compatible engine (vLLM / SGLang / llama.cpp /
+  Ollama) on your own GPUs, or a hosted OpenAI/Anthropic-compatible API. Results
+  land as a matched JSONL + dead-letter sidecar locally, or in S3/GCS/Azure.
+
 ## Tags
 
 | Tag | What |
@@ -55,7 +94,10 @@ docker run --rm -p 8080:8080 -v forge-data:/data \
 
 Unmodified OpenAI SDK code (`files.create` → `batches.create` → poll →
 `files.content`) then runs its batch flow against **your own engines** — with
-live per-item progress and partial results retrievable mid-run. `/v1/health` is
+live per-item progress. (Results are retrievable once the batch reaches
+`completed` — that is the only state which stamps `output_file_id`, so a
+cancelled batch has no output file and there is no mid-run partial fetch
+through the OpenAI file contract.) `/v1/health` is
 the unauthenticated liveness route; everything else requires the bearer key.
 
 ## Kubernetes

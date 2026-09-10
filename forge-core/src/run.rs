@@ -4,7 +4,8 @@
 //! re-queue anything a dead/spot-killed worker left leased. No task graph, no
 //! sequencing, no successors — a homogeneous work-distribution loop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -67,6 +68,15 @@ pub struct RunConfig {
     /// a load (every `load()` is `None` → exact round-robin), so it's safe on by
     /// default. Set `false` to force round-robin regardless.
     pub load_aware: bool,
+    /// How often to emit a progress line while the run is working.
+    ///
+    /// A multi-hour job used to log nothing at all between "starting" and "done", so an
+    /// operator watching a log stream could not tell a working run from a wedged one —
+    /// the "your batch jobs run at 2am alone" complaint, in the one place forge is
+    /// supposed to answer it. The heartbeat is what makes a silent stream diagnosable.
+    ///
+    /// `Duration::ZERO` disables it.
+    pub progress_every: Duration,
 }
 
 impl Default for RunConfig {
@@ -79,6 +89,10 @@ impl Default for RunConfig {
             ready_grace: Duration::from_secs(60),
             retry: RetryPolicy::default(),
             load_aware: true,
+            // 30s: frequent enough that a stalled run is obvious within a coffee break,
+            // rare enough that a 10-hour job adds ~1200 lines rather than drowning the
+            // stream. It is wall-clock, not per-item, so a fast job stays quiet.
+            progress_every: Duration::from_secs(30),
         }
     }
 }
@@ -177,6 +191,8 @@ pub struct BatchRun<Q, W, S> {
     /// Monotonic (conservative: errs toward a longer lease, never a premature
     /// re-queue), bounded by `cfg.lease_max`.
     peak_latency_ms: AtomicU64,
+    /// Cooperative stop signal. See [`BatchRun::with_shutdown`].
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl<Q, W, S> BatchRun<Q, W, S>
@@ -194,6 +210,7 @@ where
             store,
             cfg: RunConfig::default(),
             peak_latency_ms: AtomicU64::new(0),
+            shutdown: None,
         }
     }
 
@@ -201,6 +218,35 @@ where
     pub fn with_config(mut self, cfg: RunConfig) -> Self {
         self.cfg = cfg;
         self
+    }
+
+    /// Attach a cooperative stop signal — the graceful-drain seam.
+    ///
+    /// When the flag flips, [`run`](Self::run) stops leasing **new** work and lets
+    /// everything already in flight finish, result-before-ack, exactly as it would
+    /// have. It then returns normally with the totals it achieved. Items that were
+    /// never leased are still `Pending`, so [`JobTotals`] reports work remaining and a
+    /// `resume` picks up precisely where this left off.
+    ///
+    /// This is what a SIGTERM should do. Being killed instead is *correct* — leases
+    /// expire, the reaper reclaims them, the store write is idempotent — but it is not
+    /// free: every in-flight item is GPU time already spent that has to be spent again,
+    /// and nothing can be reclaimed until the lease TTL elapses. On a spot preemption
+    /// (a ~30s warning) or a rolling deploy, draining turns that loss into nothing.
+    ///
+    /// Deliberately **not** a hard abort: dropping the run mid-flight is what the
+    /// caller can already do by dropping the future. The point of this seam is the
+    /// opposite — to finish what was started.
+    pub fn with_shutdown(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.shutdown = Some(flag);
+        self
+    }
+
+    /// Whether a cooperative stop has been requested.
+    fn stopping(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// Borrow the queue (e.g. for a `status`/`sweep` command sharing the handle).
@@ -302,8 +348,37 @@ where
         // on every completion, and a queue round-trip per completion is fine, but a
         // reap sweep per completion is not.
         let mut last_reap: Option<Instant> = None;
+        // Progress heartbeat state. `started` anchors the rate so an ETA reflects the
+        // whole run rather than the last few seconds' jitter.
+        let started = Instant::now();
+        let mut last_progress = Instant::now();
+        let total_at_start = self.queue.counts().await?.total();
 
         loop {
+            // A cooperative stop means: lease nothing more, finish what is in flight.
+            // Draining the window here (rather than falling through to the readiness
+            // and leasing logic below) keeps the shutdown path short and makes it
+            // impossible to lease one more item on the way out.
+            if self.stopping() {
+                if let Some((widx, outcome)) = in_flight.next().await {
+                    wf[widx] -= 1;
+                    match outcome? {
+                        Dispatched::Done(usage) => totals.record_done(&usage),
+                        Dispatched::Dead => totals.items_dead += 1,
+                    }
+                    continue;
+                }
+                // Window empty: every dispatched item reached a terminal state and was
+                // stored-then-acked. Anything never leased is still Pending, so the
+                // caller's totals report work remaining and `resume` is correct.
+                tracing::info!(
+                    done = totals.items_done,
+                    dead = totals.items_dead,
+                    "shutdown requested; in-flight work drained, exiting resumable"
+                );
+                break;
+            }
+
             // Re-queue anything a dead worker left leased, on a poll-interval cadence
             // (and always on the first pass / when the window has fully drained).
             if last_reap.map_or(true, |t| t.elapsed() >= self.cfg.poll_interval)
@@ -410,6 +485,37 @@ where
                     wf[g] += 1;
                     in_flight.push(async move { (g, self.dispatch_one(worker, &item).await) });
                 }
+            }
+
+            // Heartbeat. Emitted from the top of the window loop so it fires while the
+            // run is genuinely working; a run blocked on an unready fleet reports that
+            // separately above, which is the distinction an operator needs.
+            if !self.cfg.progress_every.is_zero()
+                && last_progress.elapsed() >= self.cfg.progress_every
+            {
+                last_progress = Instant::now();
+                let done = totals.items_done + totals.items_dead;
+                let elapsed = started.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 {
+                    done as f64 / elapsed
+                } else {
+                    0.0
+                };
+                // ETA only when there is something to divide by: a rate of zero would
+                // otherwise print `inf`, which reads as a bug rather than as "no idea
+                // yet".
+                let eta_secs = (rate > 0.0 && total_at_start > done)
+                    .then(|| ((total_at_start - done) as f64 / rate) as u64);
+                tracing::info!(
+                    done = totals.items_done,
+                    dead = totals.items_dead,
+                    total = total_at_start,
+                    in_flight = in_flight.len(),
+                    items_per_sec = format_args!("{rate:.1}"),
+                    eta_secs,
+                    tokens = totals.tokens_total(),
+                    "progress"
+                );
             }
 
             // Consume exactly ONE completion, then loop to top the freed slot back up

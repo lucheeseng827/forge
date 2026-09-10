@@ -17,11 +17,27 @@ the run's `--endpoint` default: `/v1/chat/completions`, `/v1/completions`,
 OpenAI-compatible surface works unmodified, and the Anthropic-native Messages
 shape is supported alongside it.
 
-| Worker | `--engine` hint | Auth | Notes |
-|---|---|---|---|
-| Self-hosted OpenAI-compatible engine (vLLM, SGLang, llama.cpp, Ollama, routers, …) | `vllm` / `sglang` / `llamacpp` / `router` | none (network-protected) | health probe + load-aware dispatch per the hint |
-| Hosted OpenAI-compatible API | `openai-api` | `FORGE_WORKER_API_KEY` → `Authorization: Bearer` | probe skipped (assumed ready); rate limits learned from response headers |
-| Hosted Anthropic-compatible Messages API | `anthropic-api` | `FORGE_WORKER_API_KEY` → `x-api-key` + `anthropic-version` | items carry the Messages body (`url: /v1/messages`); usage (`input_tokens`/`output_tokens`, `cache_read_input_tokens`) maps into the common token accounting |
+| Worker | `--engine` hint | Auth | Verified | Notes |
+|---|---|---|---|---|
+| Self-hosted OpenAI-compatible engine (vLLM, SGLang, Ollama, routers, …) | `vllm` / `sglang` / `router` | none (network-protected) | shape | health probe + load-aware dispatch per the hint |
+| llama.cpp — **native** `/completion` | `llamacpp` | none (network-protected) | shape | no `usage` object; counts arrive top-level as `tokens_evaluated`/`tokens_predicted` and are mapped into the common accounting (total derived) |
+| llama.cpp — OpenAI-compatible route | `llamacpp` | none (network-protected) | shape | stock `usage` object |
+| Hosted OpenAI-compatible API | `openai-api` | `FORGE_WORKER_API_KEY` → `Authorization: Bearer` | shape | probe skipped (assumed ready); rate limits learned from response headers |
+| Hosted Anthropic-compatible Messages API | `anthropic-api` | `FORGE_WORKER_API_KEY` → `x-api-key` + `anthropic-version` | shape | items carry the Messages body (`url: /v1/messages`); usage (`input_tokens`/`output_tokens`, `cache_read_input_tokens`) maps into the common token accounting; total derived |
+
+**What "Verified" means, exactly.** `shape` = forge is driven against that engine's
+documented response shape in
+[`forge-worker/tests/engine_compat.rs`](../forge-worker/tests/engine_compat.rs) and
+asserted to extract the right content and the right token counts. That is a real
+regression guard for the wire contract, and it is all it is.
+
+**No row is yet verified against real hardware.** A recorded shape cannot catch an
+engine that changed its response between releases, a gateway that rewrites headers, or
+anything about behaviour under load. Publishing a run against real vLLM, real SGLang
+and one hosted API — same input, same `custom_id`s, three cost lines — is the
+outstanding item; see [`../RUNBOOK_AND_VALUE.md`](../RUNBOOK_AND_VALUE.md) §3 seam 7.
+Until that exists, treat this column as "the parser handles this shape", not "this
+combination has been run".
 
 - **Auth is env-only and off by default.** With no `FORGE_WORKER_API_KEY` set, forge
   sends no `Authorization`/API key to workers — BYO endpoints are assumed
@@ -149,6 +165,7 @@ Served by the `forge-batch` crate (`tiny_http`); every route except `/v1/health`
 | method | path | body / params | returns |
 |---|---|---|---|
 | `GET` | `/v1/health` | — (no auth) | `{status:"ok", batches:N}` |
+| `GET` | `/metrics` | bearer | Prometheus text exposition (`text/plain; version=0.0.4`): `forge_batches{status}` / `forge_batch_items{state}` / `forge_files` gauges, plus monotonic `*_total` counters (batches created/completed/cancelled/failed, files uploaded, HTTP requests/errors) so `rate()` works. Behind the key, unlike `/v1/health`: it carries per-status batch and item counts, not just liveness. |
 | `POST` | `/v1/files` | raw JSONL body (`purpose=batch`) | File object `{id:"file-…", object:"file", bytes, created_at, filename, purpose}` |
 | `GET` | `/v1/files/{id}` | — | the File object |
 | `GET` | `/v1/files/{id}/content` | — | input file → bytes as-is; **output** file → one OpenAI batch-output line per result (see below) |
@@ -172,9 +189,11 @@ CLI results file — map by id, never position.
 JSONL body, **not** multipart — the SDK's `files.create` (multipart) needs a raw POST
 shim; every other SDK call is native. The `cancelling` transient is elided (→ straight
 to `cancelled`). Output content is buffered while reshaping (input files stream). No
-list pagination / `metadata`. A `serve-batch` **restart re-lists batches** from disk
-and re-finalizes any that drained while it was down, but does **not** auto-resume an
-in-flight run — the batch's `ckpt.db` is intact for `forge resume`.
+list pagination / `metadata`. A `serve-batch` **restart re-lists batches** from disk,
+re-finalizes any that drained while it was down, **and restarts the fan-out for any left
+in flight** — the hydrate, the queue and the store are all idempotent, so a resumed batch
+completes every item exactly once. SIGTERM (not just Ctrl-C) shuts the server down
+gracefully, cancelling and joining each running batch so its `ckpt.db` is left resumable.
 
 ## 3. Library API (forge-core and friends)
 

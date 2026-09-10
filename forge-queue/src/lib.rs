@@ -19,7 +19,7 @@
 #[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteQueue;
+pub use sqlite::{snapshot_db, SqliteQueue};
 
 #[cfg(feature = "redb")]
 mod redb_backend;

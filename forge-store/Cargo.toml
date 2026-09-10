@@ -18,11 +18,15 @@ object_store = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+# Adapts object_store's Bytes stream into an AsyncRead so the SHARED line-oriented
+# ingest drives an object-store input unchanged (no parallel implementation to drift).
+# Optional, so it never reaches the lean musl binary.
+tokio-util = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 
 [features]
 default = []
-object_store = ["dep:object_store", "dep:url", "dep:bytes", "dep:futures-util"]
+object_store = ["dep:object_store", "dep:url", "dep:bytes", "dep:futures-util", "dep:tokio-util"]
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]

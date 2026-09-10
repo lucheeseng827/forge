@@ -63,3 +63,16 @@ The core four are `run | resume | status | sweep`; `run` and `resume` share the
 | Env | Purpose |
 |-----|---------|
 | `RUST_LOG` | `tracing` subscriber filter (default `info`) |
+| `FORGE_LOG_FORMAT` | `text` (default) or `json`. `json` emits one flattened JSON object per line for a log shipper. The global `--log-format` flag overrides it; an unparseable value warns and falls back to `text` rather than refusing to start. |
+
+Global flags (accepted on every subcommand):
+
+| Flag | Purpose |
+|------|---------|
+| `--log-format <text\|json>` | As above. |
+
+Diagnostics go to **stderr**; stdout carries the command's own output, so
+`forge status --json \| jq` stays pipeable.
+
+The full reference — every flag, every subcommand — is
+[`docs/CONFIG.md`](../docs/CONFIG.md).

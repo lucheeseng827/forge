@@ -114,6 +114,7 @@ async fn dispatch_is_concurrent_and_bounded_by_capacity() {
         ready_grace: Duration::from_secs(5),
         retry: RetryPolicy::default(),
         load_aware: true,
+        ..RunConfig::default()
     };
     let totals = BatchRun::new(queue, vec![worker], store)
         .with_config(cfg)
@@ -158,6 +159,7 @@ async fn capacity_is_the_sum_over_workers() {
         ready_grace: Duration::from_secs(5),
         retry: RetryPolicy::default(),
         load_aware: true,
+        ..RunConfig::default()
     };
     let totals = BatchRun::new(queue, vec![a, b], store)
         .with_config(cfg)
@@ -213,6 +215,7 @@ async fn stress_128_worker_fleet_fans_out_without_oversubscribing() {
         ready_grace: Duration::from_secs(5),
         retry: RetryPolicy::default(),
         load_aware: true,
+        ..RunConfig::default()
     };
     let totals = BatchRun::new(queue, workers, store)
         .with_config(cfg)

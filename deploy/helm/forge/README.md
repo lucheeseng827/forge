@@ -33,7 +33,8 @@ set `image.repository`.
 
 Then any OpenAI SDK pointed at `http://<service>:8080/v1` runs its batch flow
 (`files.create` → `batches.create` → poll → `files.content`) against your own
-engines, with live per-item progress and mid-run partial results.
+engines, with live per-item progress. (Results become fetchable when the batch
+finalizes; the OpenAI file contract has no mid-run partial fetch.)
 
 ## One-shot batch as a Job
 

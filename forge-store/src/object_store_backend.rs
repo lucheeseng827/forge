@@ -26,7 +26,7 @@ use std::sync::Arc;
 use forge_core::{ForgeError, ItemResult, ResultStore, UsageTotals};
 use futures_util::TryStreamExt;
 use object_store::path::Path as ObjPath;
-use object_store::{GetOptions, ObjectStore, PutMode, PutOptions};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
@@ -223,6 +223,85 @@ impl ObjStore {
         inner.emitted.insert(r.custom_id.clone());
         Ok(())
     }
+}
+
+/// Open a JSONL **input** object as a byte stream, positioned at `start_offset`.
+///
+/// The counterpart to `--out s3://…`, and the half that was missing: results could go
+/// to an object store while inputs still had to be a local file, so every user staged
+/// tens of GB onto a disk before forge would look at it.
+///
+/// Returns the reader plus the offset it is **actually** positioned at, which is not
+/// always the one asked for. If the recorded offset is past the object's current end —
+/// the input was replaced or truncated between runs — this rewinds to 0 rather than
+/// serving an empty range, mirroring the local path's guard: silently ingesting
+/// nothing is a data-loss footgun, and `enqueue` dedups already-hydrated ids so a full
+/// rescan is safe, just slower.
+///
+/// Streaming, not staging: the object is read as a byte stream, so a 50M-line input is
+/// never held in RAM and never needs local disk.
+pub async fn open_input_stream(
+    url: &str,
+    start_offset: u64,
+) -> Result<(Box<dyn tokio::io::AsyncBufRead + Unpin + Send>, u64), ForgeError> {
+    let parsed =
+        url::Url::parse(url).map_err(|e| ForgeError::Config(format!("input url {url:?}: {e}")))?;
+    let (store, path) = object_store::parse_url_opts(&parsed, scheme_env_opts(&parsed))
+        .map_err(|e| ForgeError::Store(format!("opening input {url:?}: {e}")))?;
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+
+    let meta = store
+        .head(&path)
+        .await
+        .map_err(|e| ForgeError::Store(format!("stat {url:?}: {e}")))?;
+    let len = meta.size;
+
+    let start = if start_offset == 0 {
+        0
+    } else if start_offset <= len {
+        tracing::info!(
+            start_offset,
+            "resuming ingest from checkpoint (object store)"
+        );
+        start_offset
+    } else {
+        tracing::warn!(
+            start_offset,
+            object_len = len,
+            "input object is shorter than the checkpoint offset (replaced/truncated); \
+             rescanning from the start"
+        );
+        0
+    };
+
+    // Everything already ingested. `start == len` is a perfectly ordinary resume
+    // state, but it would ask for the empty range `len..len`, which object stores
+    // reject as invalid — so short-circuit to an empty reader rather than turning a
+    // completed job's resume into a hard error. (The local-file path gets this for
+    // free by seeking to EOF and reading zero bytes.)
+    if start >= len {
+        return Ok((
+            Box::new(tokio::io::BufReader::new(tokio::io::empty())),
+            start,
+        ));
+    }
+
+    let opts = GetOptions {
+        range: (start > 0).then(|| (start..len).into()),
+        ..Default::default()
+    };
+    let got = store
+        .get_opts(&path, opts)
+        .await
+        .map_err(|e| ForgeError::Store(format!("reading {url:?}: {e}")))?;
+
+    // object_store yields Bytes chunks; StreamReader turns that into an AsyncRead so
+    // the shared line-oriented ingest can drive it unchanged.
+    let stream = got
+        .into_stream()
+        .map_err(|e| std::io::Error::other(e.to_string()));
+    let reader = tokio_util::io::StreamReader::new(stream);
+    Ok((Box::new(tokio::io::BufReader::new(reader)), start))
 }
 
 /// Open an [`ObjStore`] from a `forge run --out` URL — `s3://` / `gs://` / `az://`
@@ -537,5 +616,76 @@ mod tests {
         let file = url::Url::parse("file:///tmp/forge-out").unwrap();
         let s = ObjStore::from_url(&file, std::iter::empty::<(String, String)>(), "j").unwrap();
         assert!(s.prefix.ends_with("results/j"));
+    }
+    /// A temp dir + a JSONL file in it, addressed as a `file://` URL. LocalFileSystem
+    /// is a real object store, so this exercises the actual code path (head, ranged
+    /// get, stream adapter) with no cloud credentials.
+    fn input_fixture(name: &str, body: &str) -> (std::path::PathBuf, String) {
+        let d = std::env::temp_dir().join(format!("forge-objin-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("in.jsonl");
+        std::fs::write(&f, body).unwrap();
+        let url = format!("file://{}", f.display());
+        (d, url)
+    }
+
+    async fn read_all(url: &str, offset: u64) -> (String, u64) {
+        use tokio::io::AsyncReadExt;
+        let (mut r, start) = open_input_stream(url, offset).await.unwrap();
+        let mut out = String::new();
+        r.read_to_string(&mut out).await.unwrap();
+        (out, start)
+    }
+
+    #[tokio::test]
+    async fn reads_a_whole_object_from_offset_zero() {
+        let (d, url) = input_fixture("whole", "line-a\nline-b\nline-c\n");
+        let (body, start) = read_all(&url, 0).await;
+        assert_eq!(start, 0);
+        assert_eq!(body, "line-a\nline-b\nline-c\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_nonzero_offset_issues_a_ranged_read() {
+        // The resume path: start mid-object and get only the tail. Byte 7 is the start
+        // of "line-b", which is what a Shard offset would point at.
+        let (d, url) = input_fixture("ranged", "line-a\nline-b\nline-c\n");
+        let (body, start) = read_all(&url, 7).await;
+        assert_eq!(start, 7);
+        assert_eq!(body, "line-b\nline-c\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_rewinds_instead_of_reading_nothing() {
+        // The truncated/replaced-input footgun. Serving an empty range here would
+        // silently ingest nothing and look like a successful no-op run, which is the
+        // exact failure the local path already guards against.
+        let (d, url) = input_fixture("truncated", "short\n");
+        let (body, start) = read_all(&url, 9_999).await;
+        assert_eq!(start, 0, "must rewind, not serve an empty range");
+        assert_eq!(body, "short\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn an_offset_exactly_at_the_end_is_a_clean_empty_tail() {
+        // Boundary: everything was already ingested. Legitimately nothing left to read,
+        // and it must NOT be mistaken for the truncation case and rescanned.
+        let (d, url) = input_fixture("exact", "abcdef\n");
+        let (body, start) = read_all(&url, 7).await;
+        assert_eq!(start, 7, "an exact-EOF offset is valid, not a rewind");
+        assert_eq!(body, "");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_bad_url_is_a_config_error_not_a_panic() {
+        assert!(matches!(
+            open_input_stream("not a url", 0).await,
+            Err(ForgeError::Config(_))
+        ));
     }
 }

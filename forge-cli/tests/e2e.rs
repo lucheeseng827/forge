@@ -41,6 +41,7 @@ fn fast_cfg() -> RunConfig {
             cap: Duration::from_millis(2),
         },
         load_aware: true,
+        ..RunConfig::default()
     }
 }
 

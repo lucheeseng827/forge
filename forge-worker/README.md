@@ -54,6 +54,13 @@ The coordinator holds workers behind the `Worker` trait and pulls leased items t
 
 ## Config
 
+| Env | Purpose |
+|-----|---------|
+| `FORGE_WORKER_API_KEY` | Optional bearer/API key for **hosted** endpoints (`openai-api` → `Authorization: Bearer`; `anthropic-api` → `x-api-key` + `anthropic-version`). Env-only by design — never a flag, never logged. Unset (the default) sends no auth headers at all. |
+| `FORGE_WORKER_API_KEY_<WORKER_ID>` | Per-worker override, for a fleet spanning two hosted providers — one process-global key cannot be both an OpenAI key and an Anthropic key. The id is upper-cased with every non-alphanumeric byte mapped to `_`, so `spill` reads `FORGE_WORKER_API_KEY_SPILL` and `gpu-1` reads `FORGE_WORKER_API_KEY_GPU_1`. Falls back to the global variable when unset. |
+
+See [`docs/CONFIG.md`](../docs/CONFIG.md) for the full reference.
+
 Cargo features:
 
 | Feature | Effect |

@@ -162,7 +162,9 @@ Two flows sit on top of the same loop:
 - **Batch REST** (`forge serve-batch`): `/v1/files` upload lands the input
   JSONL, `batches.create` is a job submit, batch status maps **live queue
   counts** (real per-item progress), and result retrieval streams output lines
-  — retrievable **mid-run**, not only at completion.
+  once the batch is `completed` — `output_file_id` is stamped at finalize, so
+  the file contract has no mid-run partial fetch. The *store* is written
+  incrementally throughout, which a self-hosted operator can read directly.
 
 ## 5. The item state machine — delivery semantics
 
@@ -229,9 +231,12 @@ Capability-by-capability, all of it verifiable in this repo:
 - **Resume-readiness is queryable.** `forge audit` reports pending / live-lease
   / orphaned-lease / done / dead and what a resume would reclaim — the answer
   batch operators otherwise reconstruct by hand-joining input against output.
-- **Real per-item progress and mid-run partials.** Batch status is live queue
-  counts, and results stream out while the run is still going — against a
-  closed batch window you get neither.
+- **Real per-item progress.** Batch status is live queue
+  counts, and results land in the store incrementally as the run proceeds rather
+  than all at the end — against a closed batch window you get neither. (Through
+  the OpenAI file contract they become *fetchable* at finalize, when
+  `output_file_id` is stamped; the incremental part is the on-disk store, which a
+  self-hosted operator can read directly.)
 - **The OpenAI Batch REST contract over your own GPUs.** Unmodified OpenAI SDK
   code (`batches.create` / `retrieve` / `files.content`) runs against
   `forge serve-batch` — with your model weights, your spot economics, and no

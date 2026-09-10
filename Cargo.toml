@@ -18,10 +18,10 @@ members = [
 # `cargo check --workspace`.
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/lucheeseng827/nick-rust-project"
+repository = "https://github.com/lucheeseng827/forge"
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -47,7 +47,10 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `json` for machine-readable logs: an operator shipping to Loki/Datadog/CloudWatch
+# should not have to regex-parse a human format. Pulls only `tracing-serde` (pure Rust,
+# tiny) on top of serde/serde_json, which are already here.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 redb = "2"
 rand = "0.8"
@@ -63,6 +66,10 @@ governor = { version = "0.10", default-features = false, features = ["std"] }
 # crypto-config item. The default static binary is unaffected (feature off).
 object_store = { version = "0.14", default-features = false, features = ["aws", "gcp", "azure", "fs"] }
 url = "2"
+# Stream adapter for object-store INPUT (Bytes stream -> AsyncRead). Pure Rust,
+# musl-clean, and pulled in only by forge-store's off-by-default `object_store`
+# feature, so the lean forge-cli binary never sees it.
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 bytes = "1"
 # Columnar Parquet output — OPTIONAL, behind forge-store's off-by-default `parquet`
 # feature. Pure-Rust: default-features=false + snap (Snappy) avoids the zstd/brotli C

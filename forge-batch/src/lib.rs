@@ -42,14 +42,14 @@
 //! it). A GET on such a batch reads its live queue counts; if it turns out already
 //! drained, it is finalized to `completed` on read.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use forge_core::{now_ms, BatchRun, ForgeError, Queue, RunConfig, Worker};
 use forge_queue::SqliteQueue;
@@ -229,6 +229,7 @@ impl BatchServer {
 /// / `serve_intake`.
 pub fn serve_batch<F: WorkerFleet>(cfg: BatchConfig<F>) -> Result<BatchServer, ForgeError> {
     let state = Arc::new(ServerState::bootstrap(cfg)?);
+    resume_in_flight(&state);
 
     let server = Arc::new(
         tiny_http::Server::http(&state.bind).map_err(|e| ForgeError::Config(e.to_string()))?,
@@ -362,8 +363,29 @@ struct Registry {
     files: HashMap<String, FileRecord>,
 }
 
+/// Process-lifetime counters for `/metrics`.
+///
+/// These are deliberately **counters**, not gauges: they only ever increase, so
+/// `rate()` and `increase()` work on them. The registry already tells you the current
+/// level (how many batches are in progress right now) — what it cannot tell you is
+/// throughput, which is the question an alert actually asks ("are we still completing
+/// batches?"). A gauge-only exposition, which is all forge had, cannot answer that.
+///
+/// They reset on restart, as counters should; Prometheus handles the reset.
+#[derive(Debug, Default)]
+struct Metrics {
+    batches_created: AtomicU64,
+    batches_completed: AtomicU64,
+    batches_cancelled: AtomicU64,
+    batches_failed: AtomicU64,
+    files_uploaded: AtomicU64,
+    http_requests: AtomicU64,
+    http_errors: AtomicU64,
+}
+
 /// Shared server state behind the accept threads.
 struct ServerState<F: WorkerFleet> {
+    metrics: Metrics,
     bind: String,
     threads: usize,
     data_dir: PathBuf,
@@ -374,6 +396,10 @@ struct ServerState<F: WorkerFleet> {
     /// `ServerState`, isn't generic over `F` — can hold its own clone and join every
     /// per-batch supervisor thread on shutdown, not just the HTTP accept threads.
     registry: Arc<Mutex<Registry>>,
+    /// When this process started serving, for `/v1/health`. An uptime that keeps
+    /// resetting is the signature of a crash loop, and it is the one thing a probe can
+    /// see that a bare `ok` cannot express.
+    started: Instant,
 }
 
 impl<F: WorkerFleet> ServerState<F> {
@@ -384,21 +410,53 @@ impl<F: WorkerFleet> ServerState<F> {
 
         let mut registry = Registry::default();
         // Re-load the file registry.
+        //
+        // **Errors are propagated, not swallowed.** This used to be a nest of
+        // `if let Ok(..)`, so an unreadable or truncated `files.json` started the server
+        // with an EMPTY registry — and the next upload persisted that empty map, turning
+        // a recoverable file into permanent loss of every file record, silently. A
+        // registry that cannot be read is a state a human has to see.
         let files_json = data_dir.join("files.json");
-        if files_json.exists() {
-            if let Ok(bytes) = std::fs::read(&files_json) {
-                if let Ok(map) = serde_json::from_slice::<HashMap<String, FileRecord>>(&bytes) {
-                    registry.files = map;
-                }
+        match std::fs::read(&files_json) {
+            Ok(bytes) => {
+                registry.files = serde_json::from_slice(&bytes).map_err(|e| {
+                    ForgeError::Store(format!(
+                        "file registry {} is unreadable: {e}. It maps every uploaded \
+                         file id to its bytes on disk, so starting without it would \
+                         report `no such input_file_id` for work that is still there — \
+                         and the next upload would overwrite it, making the loss \
+                         permanent. The uploaded bytes are intact under {}/files/; \
+                         restore the registry from a backup, or move it aside \
+                         deliberately to start a fresh one.",
+                        files_json.display(),
+                        data_dir.display(),
+                    ))
+                })?;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // first boot
+            Err(e) => return Err(e.into()),
         }
+
         // Re-list existing batches from their per-dir batch.json.
+        //
+        // A batch directory whose `batch.json` cannot be parsed is skipped with a loud
+        // warning rather than failing the boot: unlike the file registry, one bad batch
+        // record costs only that batch's listing, and refusing to start would take the
+        // whole server down over a single job. Its `ckpt.db` and results are untouched
+        // on disk either way.
         if let Ok(entries) = std::fs::read_dir(data_dir.join("batches")) {
             for entry in entries.flatten() {
                 let dir = entry.path();
                 let meta = dir.join("batch.json");
-                if let Ok(bytes) = std::fs::read(&meta) {
-                    if let Ok(record) = serde_json::from_slice::<BatchRecord>(&bytes) {
+                if !meta.exists() {
+                    continue;
+                }
+                match std::fs::read(&meta)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| {
+                        serde_json::from_slice::<BatchRecord>(&b).map_err(|e| e.to_string())
+                    }) {
+                    Ok(record) => {
                         registry.batches.insert(
                             record.id.clone(),
                             BatchEntry {
@@ -410,11 +468,18 @@ impl<F: WorkerFleet> ServerState<F> {
                             },
                         );
                     }
+                    Err(e) => tracing::error!(
+                        path = %meta.display(),
+                        error = %e,
+                        "unreadable batch record; skipping it in the listing (its \
+                         checkpoint and results are untouched on disk)"
+                    ),
                 }
             }
         }
 
         Ok(Self {
+            metrics: Metrics::default(),
             bind: cfg.bind,
             threads: cfg.threads,
             data_dir,
@@ -422,6 +487,7 @@ impl<F: WorkerFleet> ServerState<F> {
             fleet: Arc::new(cfg.fleet),
             run_config: cfg.run_config,
             registry: Arc::new(Mutex::new(registry)),
+            started: Instant::now(),
         })
     }
 
@@ -432,16 +498,48 @@ impl<F: WorkerFleet> ServerState<F> {
     /// Persist the whole file registry (called under the registry lock after a change).
     fn persist_files(&self, files: &HashMap<String, FileRecord>) {
         if let Ok(bytes) = serde_json::to_vec_pretty(files) {
-            let _ = std::fs::write(self.files_json(), bytes);
+            if let Err(e) = write_atomic(&self.files_json(), &bytes) {
+                // Worth shouting about: this file is the ONLY record of which uploaded
+                // bytes belong to which file id. Losing it strands every batch that
+                // references one.
+                tracing::error!(error = %e, "could not persist the file registry");
+            }
         }
     }
 }
 
-/// Persist one batch record to its `batch.json` (best-effort; a lost write only costs
-/// re-list fidelity, never correctness — the queue is the source of truth).
+/// Write `bytes` to `path` atomically: temp file beside the target, fsync, rename.
+///
+/// A plain `fs::write` truncates first and then writes, so a crash — or an OOM kill, or
+/// a node losing power — in that window leaves a **truncated** registry. Since the
+/// loader used to swallow every parse error and start blank, the next write then
+/// persisted the blank map and the loss became permanent. Atomicity is what makes the
+/// loader's refusal (see [`ServerState::bootstrap`]) a recoverable state rather than a
+/// dead end: a rename either happened or it did not, so what is on disk is always one
+/// whole registry or the other.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        // fsync before the rename: a rename that lands ahead of its data leaves a
+        // zero-length file after a power cut, which is exactly the corruption this
+        // function exists to prevent.
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Persist one batch record to its `batch.json`.
+///
+/// Atomic for the same reason as the file registry: this is what a restart re-lists a
+/// batch from, and a half-written record is a batch the server can no longer describe.
 fn persist_batch(dir: &Path, record: &BatchRecord) {
     if let Ok(bytes) = serde_json::to_vec_pretty(record) {
-        let _ = std::fs::write(dir.join("batch.json"), bytes);
+        if let Err(e) = write_atomic(&dir.join("batch.json"), &bytes) {
+            tracing::error!(batch = %record.id, error = %e, "could not persist batch record");
+        }
     }
 }
 
@@ -496,6 +594,10 @@ fn finalize_completed<F: WorkerFleet>(state: &ServerState<F>, id: &str) {
 
     let entry = reg.batches.get_mut(id).unwrap();
     entry.record.status = S_COMPLETED.to_string();
+    state
+        .metrics
+        .batches_completed
+        .fetch_add(1, Ordering::Relaxed);
     entry.record.completed_at = Some(now_ms());
     entry.record.output_file_id = output_file_id;
     entry.record.error_file_id = error_file_id;
@@ -512,6 +614,7 @@ fn finalize_failed<F: WorkerFleet>(state: &ServerState<F>, id: &str) {
         return;
     }
     entry.record.status = S_FAILED.to_string();
+    state.metrics.batches_failed.fetch_add(1, Ordering::Relaxed);
     entry.record.completed_at = Some(now_ms());
     persist_batch(&entry.dir, &entry.record);
 }
@@ -575,6 +678,87 @@ fn mint_result_file(
         },
     );
     Some(id)
+}
+
+/// Restart the supervisor for every batch left `in_progress` by a previous process.
+///
+/// Without this a restart produces a **zombie**: `bootstrap` re-lists the batch with
+/// `task: None` and its persisted status still `in_progress`, so `GET /v1/batches/{id}`
+/// answers `in_progress` forever while nothing is running it. The customer's SDK polls
+/// a status that will never change, and the job simply stops — the exact 3am failure,
+/// with the API actively reporting that everything is fine. (A batch that *drained*
+/// before the crash was already finalized on read; the hole was the half-done one,
+/// which is the common case, because a process is most likely to die while it is busy.)
+///
+/// Resuming is safe because every step is idempotent: `ingest_jsonl` skips ids already
+/// hydrated, the queue is the durable source of truth, and the store dedups by
+/// `custom_id`. It is the same path `forge resume` takes — this just takes it
+/// automatically, because nobody is awake to type it.
+///
+/// A batch whose input file is no longer in the registry cannot be resumed; it is
+/// failed with a reason rather than left claiming progress it will never make.
+fn resume_in_flight<F: WorkerFleet>(state: &Arc<ServerState<F>>) {
+    // Collect first, then spawn: holding the registry lock across a thread spawn that
+    // itself wants the lock is a deadlock waiting to be discovered at 3am.
+    let pending: Vec<(String, PathBuf, Option<PathBuf>, Arc<AtomicBool>)> = {
+        let reg = state.registry.lock().unwrap();
+        reg.batches
+            .values()
+            .filter(|e| e.record.status == S_IN_PROGRESS)
+            .map(|e| {
+                let input = reg
+                    .files
+                    .get(&e.record.input_file_id)
+                    .map(|f| f.path.clone());
+                (
+                    e.record.id.clone(),
+                    e.dir.clone(),
+                    input,
+                    Arc::clone(&e.cancel),
+                )
+            })
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        batches = pending.len(),
+        "resuming batches left in flight by a previous process"
+    );
+
+    for (id, dir, input, cancel) in pending {
+        let Some(input_path) = input else {
+            tracing::error!(
+                batch = %id,
+                "cannot resume: its input file is no longer in the registry. Failing it \
+                 rather than leaving it reporting in_progress forever."
+            );
+            finalize_failed(state, &id);
+            continue;
+        };
+        let handle = {
+            let state = Arc::clone(state);
+            let id2 = id.clone();
+            std::thread::Builder::new()
+                .name(format!("forge-batch-{id}"))
+                .spawn(move || run_supervisor(state, id2, dir, input_path, cancel))
+        };
+        match handle {
+            Ok(t) => {
+                let mut reg = state.registry.lock().unwrap();
+                if let Some(e) = reg.batches.get_mut(&id) {
+                    e.task = Some(t);
+                }
+            }
+            Err(e) => {
+                // Same rule as `create_batch`: no supervisor means nothing will ever
+                // advance this batch, and `in_progress` would be a lie.
+                tracing::error!(batch = %id, error = %e, "could not spawn resume supervisor");
+                finalize_failed(state, &id);
+            }
+        }
+    }
 }
 
 /// The per-batch supervisor, run on its **own** OS thread + current-thread runtime.
@@ -675,20 +859,52 @@ fn handle_request<F: WorkerFleet>(
     let method = req.method().clone();
     let raw_url = req.url().to_string();
     let path = raw_url.split('?').next().unwrap_or(&raw_url).to_string();
+    state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
 
-    // Liveness needs no auth.
+    // Bind a correlation id for this request. Held for the whole handler, so every log
+    // line it emits and every response it writes carry the same id — which is what lets
+    // a customer quoting an id from a 500 be joined to the server-side detail.
+    let _rid = forge_core::scope_request_id(forge_core::accept_request_id(
+        header_value(req.headers(), "x-request-id").as_deref(),
+    ));
+    tracing::debug!(method = %method.as_str(), path, "request");
+
+    // Liveness needs no auth — a load balancer holds no credential.
+    //
+    // It reports what a probe and a support ticket need (is this process serving, which
+    // build is it, how long has it been up) and **not** the batch count it used to
+    // return. That count is business telemetry: how much work a customer is running is
+    // exactly the class of figure `/metrics` is gated on, and leaking it to any
+    // unauthenticated caller made the gate on `/metrics` decorative. It is still
+    // available there, behind the key.
     if method == tiny_http::Method::Get && path == "/v1/health" {
-        let n = state.registry.lock().unwrap().batches.len();
-        let body = serde_json::json!({ "status": "ok", "batches": n }).to_string();
+        let body = serde_json::json!({
+            "status": "ok",
+            "service": "forge-serve-batch",
+            "build": forge_core::build::json(),
+            "uptime_secs": state.started.elapsed().as_secs(),
+        })
+        .to_string();
         return respond_json(req, 200, body);
     }
 
     // Bearer auth on everything else (when a key is configured).
+    //
+    // `/metrics` is deliberately INSIDE the authenticated set, unlike `/v1/health`.
+    // Health has to be reachable by a load balancer that holds no credential and it
+    // leaks only a batch count; metrics expose per-status batch and item counts, which
+    // is business telemetry. Prometheus supports bearer tokens, so the cost of keeping
+    // it behind the key is a two-line scrape config.
     if let Some(expected) = &state.api_key {
         let auth = header_value(req.headers(), "authorization");
         if !bearer_matches(auth.as_deref(), expected) {
+            state.metrics.http_errors.fetch_add(1, Ordering::Relaxed);
             return respond_unauthorized(req);
         }
+    }
+
+    if method == tiny_http::Method::Get && path == "/metrics" {
+        return serve_metrics(rt, req, state);
     }
 
     let m = &method;
@@ -725,6 +941,7 @@ fn handle_request<F: WorkerFleet>(
         }
     }
 
+    state.metrics.http_errors.fetch_add(1, Ordering::Relaxed);
     respond_text(req, 404, "no such route");
 }
 
@@ -745,7 +962,7 @@ fn upload_file<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerSt
     let id = format!("file-{}", rand_hex(12));
     let path = state.data_dir.join("files").join(format!("{id}.jsonl"));
     if let Err(e) = std::fs::write(&path, &body) {
-        return respond_text(req, 500, &format!("could not persist upload: {e}"));
+        return respond_internal(req, "persisting an upload", e);
     }
 
     let record = FileRecord {
@@ -761,6 +978,7 @@ fn upload_file<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerSt
     {
         let mut reg = state.registry.lock().unwrap();
         reg.files.insert(id, record);
+        state.metrics.files_uploaded.fetch_add(1, Ordering::Relaxed);
         state.persist_files(&reg.files);
     }
     respond_json(req, 200, serde_json::to_string(&object).unwrap_or_default());
@@ -837,7 +1055,7 @@ fn create_batch<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerS
     let id = format!("batch-{}", rand_hex(12));
     let dir = state.data_dir.join("batches").join(&id);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return respond_text(req, 500, &format!("could not create batch dir: {e}"));
+        return respond_internal(req, "creating a batch directory", e);
     }
 
     let now = now_ms();
@@ -878,7 +1096,7 @@ fn create_batch<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerS
                 // fan-out — reporting `in_progress` here would strand the batch forever
                 // with no way for the caller to detect it. Fail the request instead of
                 // persisting an unrunnable batch.
-                return respond_text(req, 500, &format!("could not spawn batch supervisor: {e}"));
+                return respond_internal(req, "spawning a batch supervisor", e);
             }
         }
     };
@@ -897,7 +1115,156 @@ fn create_batch<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerS
             },
         );
     }
+    state
+        .metrics
+        .batches_created
+        .fetch_add(1, Ordering::Relaxed);
     respond_json(req, 200, serde_json::to_string(&object).unwrap_or_default());
+}
+
+/// `GET /metrics` — Prometheus text exposition.
+///
+/// Why this exists: `serve-batch` is a long-running service deployed by the OSS Helm
+/// chart, and until now it served exactly `/v1/health`. The documented way to collect
+/// forge metrics was `forge status --prometheus` on a timer — a CLI read of a
+/// checkpoint file — which is impossible in the shipped container, because the image
+/// is `FROM scratch` and has no shell to run it from.
+///
+/// Both metric kinds are present on purpose:
+///
+/// - **Counters** (`_total`) are process-lifetime and monotonic, so `rate()` answers
+///   "are we still completing batches?" — the question an alert actually asks.
+/// - **Gauges** are current levels (how many batches are in progress, how many items
+///   are pending right now). A level cannot be rated and a rate cannot be levelled;
+///   exposing only gauges, which is what `status --prometheus` does, leaves the
+///   throughput question unanswerable.
+fn serve_metrics<F: WorkerFleet>(
+    rt: &tokio::runtime::Handle,
+    req: tiny_http::Request,
+    state: &Arc<ServerState<F>>,
+) {
+    use std::fmt::Write;
+
+    // Snapshot ids and statuses under the lock, then read each batch's live counts
+    // outside it — `read_counts` takes the same lock, and holding it across a queue
+    // read would serialize every request behind a scrape.
+    let (ids, files): (Vec<(String, String)>, usize) = {
+        let reg = state.registry.lock().unwrap();
+        (
+            reg.batches
+                .iter()
+                .map(|(id, e)| (id.clone(), e.record.status.clone()))
+                .collect(),
+            reg.files.len(),
+        )
+    };
+
+    let mut by_status: BTreeMap<&str, u64> = BTreeMap::new();
+    for (_, status) in &ids {
+        *by_status.entry(status.as_str()).or_default() += 1;
+    }
+    // Report every status the server can produce, including the ones at zero, so a
+    // dashboard does not show a gap when nothing has failed yet.
+    for st in [
+        S_IN_PROGRESS,
+        S_COMPLETED,
+        S_CANCELLING,
+        S_CANCELLED,
+        S_FAILED,
+    ] {
+        by_status.entry(st).or_insert(0);
+    }
+
+    let mut items = forge_core::QueueCounts::default();
+    for (id, status) in &ids {
+        if status != S_IN_PROGRESS {
+            continue; // finished batches' queues tell us nothing about current load
+        }
+        if let Some(c) = read_counts(rt, state, id) {
+            items.pending += c.pending;
+            items.leased += c.leased;
+            items.done += c.done;
+            items.dead += c.dead;
+        }
+    }
+
+    let m = &state.metrics;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# HELP forge_batches Batches currently known, by status."
+    );
+    let _ = writeln!(s, "# TYPE forge_batches gauge");
+    for (status, n) in &by_status {
+        let _ = writeln!(s, "forge_batches{{status=\"{status}\"}} {n}");
+    }
+    let _ = writeln!(
+        s,
+        "# HELP forge_files Uploaded input/output files retained."
+    );
+    let _ = writeln!(s, "# TYPE forge_files gauge");
+    let _ = writeln!(s, "forge_files {files}");
+    let _ = writeln!(
+        s,
+        "# HELP forge_batch_items Items across in-progress batches, by state."
+    );
+    let _ = writeln!(s, "# TYPE forge_batch_items gauge");
+    for (state_name, v) in [
+        ("pending", items.pending),
+        ("leased", items.leased),
+        ("done", items.done),
+        ("dead", items.dead),
+    ] {
+        let _ = writeln!(s, "forge_batch_items{{state=\"{state_name}\"}} {v}");
+    }
+    for (name, help, v) in [
+        (
+            "forge_batches_created_total",
+            "Batches accepted since start.",
+            m.batches_created.load(Ordering::Relaxed),
+        ),
+        (
+            "forge_batches_completed_total",
+            "Batches that reached `completed` since start.",
+            m.batches_completed.load(Ordering::Relaxed),
+        ),
+        (
+            "forge_batches_cancelled_total",
+            "Batches cancelled since start.",
+            m.batches_cancelled.load(Ordering::Relaxed),
+        ),
+        (
+            "forge_batches_failed_total",
+            "Batches that reached `failed` since start.",
+            m.batches_failed.load(Ordering::Relaxed),
+        ),
+        (
+            "forge_files_uploaded_total",
+            "Files uploaded since start.",
+            m.files_uploaded.load(Ordering::Relaxed),
+        ),
+        (
+            "forge_http_requests_total",
+            "HTTP requests served since start.",
+            m.http_requests.load(Ordering::Relaxed),
+        ),
+        (
+            "forge_http_errors_total",
+            "HTTP requests answered 401 or 404 since start.",
+            m.http_errors.load(Ordering::Relaxed),
+        ),
+    ] {
+        let _ = writeln!(s, "# HELP {name} {help}");
+        let _ = writeln!(s, "# TYPE {name} counter");
+        let _ = writeln!(s, "{name} {v}");
+    }
+
+    let header = tiny_http::Header::from_bytes(
+        &b"Content-Type"[..],
+        &b"text/plain; version=0.0.4; charset=utf-8"[..],
+    )
+    .expect("static header");
+    let _ = req.respond(tiny_http::Response::from_string(s).with_header(header));
 }
 
 /// Read the live queue counts for a batch, opening (and caching) a read handle to its
@@ -1025,6 +1392,10 @@ fn cancel_batch<F: WorkerFleet>(
             // synchronous from the server's view — and stop reporting further progress.
             entry.cancel.store(true, Ordering::SeqCst);
             entry.record.status = S_CANCELLED.to_string();
+            state
+                .metrics
+                .batches_cancelled
+                .fetch_add(1, Ordering::Relaxed);
             entry.record.cancelled_at = Some(now_ms());
             persist_batch(&entry.dir, &entry.record);
         }
@@ -1094,15 +1465,49 @@ fn json_header() -> tiny_http::Header {
         .expect("static header")
 }
 
+/// The `x-request-id` header for the request in scope, if one is bound.
+///
+/// Attached to EVERY response, not just errors: "quote the request id from the
+/// response" only works as support advice if a successful-but-wrong response has one
+/// too. Built from the sanitised id, so it cannot inject a header.
+fn request_id_header() -> Option<tiny_http::Header> {
+    let id = forge_core::current_request_id()?;
+    tiny_http::Header::from_bytes(&b"x-request-id"[..], id.as_bytes()).ok()
+}
+
 fn respond_json(req: tiny_http::Request, code: u16, body: String) {
-    let resp = tiny_http::Response::from_string(body)
+    let mut resp = tiny_http::Response::from_string(body)
         .with_header(json_header())
         .with_status_code(code);
+    if let Some(h) = request_id_header() {
+        resp.add_header(h);
+    }
     let _ = req.respond(resp);
 }
 
 fn respond_text(req: tiny_http::Request, code: u16, msg: &str) {
-    let _ = req.respond(tiny_http::Response::from_string(msg.to_string()).with_status_code(code));
+    let mut resp = tiny_http::Response::from_string(msg.to_string()).with_status_code(code);
+    if let Some(h) = request_id_header() {
+        resp.add_header(h);
+    }
+    let _ = req.respond(resp);
+}
+
+/// Respond to an internal failure without describing the server.
+///
+/// The detail goes to the log against the request id; the caller gets the id and a
+/// fixed sentence. `context` is a short static label (`"persisting upload"`), never
+/// interpolated user or path data.
+fn respond_internal(req: tiny_http::Request, context: &'static str, err: impl std::fmt::Display) {
+    let id = forge_core::current_request_id().unwrap_or_else(forge_core::mint_request_id);
+    tracing::error!(request_id = %id, context, error = %err, "request failed");
+    let mut resp = tiny_http::Response::from_string(forge_core::internal_error_body(&id))
+        .with_header(json_header())
+        .with_status_code(500);
+    if let Some(h) = request_id_header() {
+        resp.add_header(h);
+    }
+    let _ = req.respond(resp);
 }
 
 fn respond_unauthorized(req: tiny_http::Request) {

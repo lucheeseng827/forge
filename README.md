@@ -1,3 +1,5 @@
+<img src="docs/images/forge-logo.svg" alt="" width="72">
+
 # forge
 
 **forge** is a single-binary, self-hosted coordinator that fans a giant JSONL of
@@ -269,9 +271,11 @@ while client.batches.retrieve(b.id).status != "completed":
 out = client.files.content(client.batches.retrieve(b.id).output_file_id)
 ```
 
-Real per-item progress (`request_counts` straight from the live queue), mid-run
-partials, spot-safe resume underneath — the things the cloud Batch APIs don't give
-you. See [`docs/API.md` §4](./docs/API.md#4-batch-rest-api-openai-compatible) for the
+Real per-item progress (`request_counts` straight from the live queue) and
+spot-safe resume underneath — the things the cloud Batch APIs don't give you.
+(Results become fetchable when the batch reaches `completed`, which is when
+`output_file_id` is stamped; there is no mid-run partial fetch through the
+OpenAI file contract.) See [`docs/API.md` §4](./docs/API.md#4-batch-rest-api-openai-compatible) for the
 full route table, object shapes, and the honest MVP limits (file upload is raw-body,
 not multipart, today).
 

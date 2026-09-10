@@ -24,15 +24,26 @@ those change.
 | `AWS_*` / `GOOGLE_*` / `AZURE_*` | strings | — | **`--features object_store` builds only**, and only when `--out`/`--results` is a cloud URL: every env var with one of these three prefixes is forwarded to the object_store builders (its `from_env` conventions — credentials, region, endpoint). `file://`/`memory://` URLs get none forwarded. Source: `env_opts`/`scheme_env_opts` in `forge-store/src/object_store_backend.rs`. | Pointing `--out` at S3/GCS/Azure. |
 
 | `FORGE_WORKER_API_KEY` | string | — | Optional bearer/API key for **hosted** worker endpoints (`--engine openai-api` → `Authorization: Bearer`; `--engine anthropic-api` → `x-api-key` + `anthropic-version`). Env-only by design — never a flag, never logged. Unset (the default) sends no auth headers at all. | Driving a hosted provider API instead of (or alongside) self-hosted engines. |
+| `FORGE_WORKER_API_KEY_<WORKER_ID>` | string | — | Per-worker override of the above, for the worker with that id (id upper-cased, every non-alphanumeric byte → `_`, so `spill` reads `FORGE_WORKER_API_KEY_SPILL` and `gpu-1` reads `FORGE_WORKER_API_KEY_GPU_1`). Falls back to the global variable when unset. | A fleet spanning **two hosted providers** — one process-global key cannot be both an OpenAI key and an Anthropic key. Name the workers with `--workers 'name=engine:url'`. |
+
+| `FORGE_LOG_FORMAT` | `text` \| `json` | `text` | Log output format for `forge`. `json` emits one JSON object per line for a log shipper. Equivalent to the global `--log-format` flag, which wins when both are set; an unparseable value warns and falls back to `text` rather than refusing to start. Logs go to **stderr** — stdout carries a command's own output, so `--json` payloads stay pipeable. | A deployment shipping logs to Loki/CloudWatch/Datadog. Set it once in the Deployment rather than on every command. |
+| `FORGE_GIT_SHA` | string | — | **Build-time only** (`--build-arg`/`cargo` env at compile time, not read at runtime). Stamps the commit into the startup log line, `forge --version` and `/v1/health`. Deliberately absent rather than guessed when a build does not supply one: a release container has no `.git`, so a `build.rs` that shelled out to git would bake in `unknown` or a stale sha from someone's laptop, and a wrong sha sends someone diffing the wrong commit. | Always, in a release build: `docker build --build-arg FORGE_GIT_SHA="$(git rev-parse --short HEAD)" .` |
 
 That is the whole list — the default binary deliberately reads no env var but
-`RUST_LOG` and (opt-in) `FORGE_WORKER_API_KEY`; with the key unset it sends **no**
-auth headers to workers (see [OPERATIONS §security](./OPERATIONS.md#security-posture)).
+`RUST_LOG`, `FORGE_LOG_FORMAT` and (opt-in) `FORGE_WORKER_API_KEY`; with the key unset
+it sends **no** auth headers to workers (see
+[OPERATIONS §security](./OPERATIONS.md#security-posture)).
 
 ## `forge` CLI
 
 Source: `Cli`/`Cmd` + the per-subcommand `*Args` structs in
 [`forge-cli/src/main.rs`](../forge-cli/src/main.rs).
+
+### Global flags (accepted on every subcommand)
+
+| flag | type | default | what it does | when to change |
+|---|---|---|---|---|
+| `--log-format` | `text` \| `json` | `text` | Log output format. `json` is one object per line, flattened, for a log shipper. Overrides `FORGE_LOG_FORMAT`. Diagnostics go to stderr in both formats; stdout is the command's own output. | Piping logs to a shipper. Prefer the env var in a deployment so it is set once. |
 
 ### Worker/dispatch flags (shared by `run` and `resume`)
 
@@ -40,7 +51,7 @@ Source: `struct WorkerArgs`.
 
 | flag | type | default | what it does | when to change |
 |---|---|---|---|---|
-| `--workers` | comma-separated URLs | **required** | The BYO OpenAI-compatible base URLs to fan out across. Workers are named `w0`, `w1`, … in URL order. | Always set. |
+| `--workers` | comma-separated `[name=][engine:]url` entries | **required** | The BYO OpenAI-compatible endpoints to fan out across. A bare URL uses the fleet-wide `--engine` and is auto-named `w0`, `w1`, … in order (unchanged from before). An `engine:` prefix overrides the hint **for that worker only**, so one run can span vLLM, SGLang and a hosted API. A `name=` prefix sets the worker id, which appears in every result line and selects that worker's key via `FORGE_WORKER_API_KEY_<NAME>`. The engine prefix is unambiguous because it is accepted only when it names a known engine — `http` is not one, so `http://gpu1:8000` stays a plain URL. Example: `--workers 'http://gpu1:8000,sglang:http://gpu2:8000,spill=openai-api:https://api.openai.com/v1'`. | Always set. Use the prefixes when the fleet is heterogeneous — notably to spill onto a hosted endpoint when spot capacity disappears. |
 | `--engine` | `vllm` \| `sglang` \| `llamacpp` \| `router` \| `openai-api` \| `anthropic-api` | `vllm` | Engine hint — affects the health-probe/load-metric shape and (for the two hosted hints) the auth-header style, never the per-item wire contract. Self-hosted hints read a queue-depth metric (vLLM `/metrics`, SGLang `/get_server_info`, llama.cpp `/slots`; `router` reads none); hosted hints skip the probe (no `/health` route to ask) and authenticate with `FORGE_WORKER_API_KEY`. | Match your engine so load-aware dispatch has a metric; `router` for a self-balancing front; the `*-api` hints for hosted provider endpoints. |
 | `--endpoint` | `chat` \| `completions` \| `embeddings` \| `messages` | `chat` | Default endpoint for items whose `url` is empty; also the fallback kind for `--require` validation. Items with their own `url` override it per line (`/v1/messages` items validate + meter in the Anthropic Messages shape). | Embedding, legacy-completions, or Anthropic-Messages batches. |
 | `--concurrency` | usize | `256` (`resume`: the recorded value) | Per-worker in-flight cap = the **ceiling** of the AIMD adaptive limiter. Set it to the engine's own knob (vLLM `--max-num-seqs`, SGLang `--max-running-requests`, llama-server `--parallel`). `run` records it in the checkpoint; a bare `resume` reuses the recorded value (an explicit flag overrides, with a warning on divergence), so a resume can never silently restart AIMD at a ceiling the fleet was not configured for. | Always match the engine; too high risks engine OOM (AIMD backs off but starts at the ceiling). |
@@ -55,7 +66,7 @@ Source: `struct WorkerArgs`.
 
 | flag | type | default | what it does |
 |---|---|---|---|
-| `--input` | path | **required** | Input JSONL (OpenAI Batch contract, one request per line keyed by `custom_id`). Malformed lines go to the reject sidecar (`<out>.reject.jsonl`, or `<checkpoint>.reject.jsonl` when `--out` is an object-store URL), never abort the job. |
+| `--input` | path **or object-store URL** | **required** | Input JSONL (OpenAI Batch contract, one request per line keyed by `custom_id`). Malformed lines go to the reject sidecar (`<out>.reject.jsonl`, or `<checkpoint>.reject.jsonl` when `--out` is an object-store URL), never abort the job. A `scheme://` URL (`s3://`/`gs://`/`az://`/`file://`, **needs `--features object_store`** — the default binary fails fast, before ingest) is **streamed**, never staged to local disk, so a 50M-line input needs no PVC; resume reads a ranged GET from the recorded checkpoint offset, and an offset past the object's end (a replaced/truncated input) rewinds and rescans rather than silently ingesting nothing. Cannot be combined with `--prefix-bucket`, which is a local reordering pass over a seekable file and is refused rather than ignored. Source: `ingest_any` in `forge-cli/src/main.rs`, `open_input_stream` in `forge-store/src/object_store_backend.rs`. |
 | `--out` | path **or object-store URL** | **required** | Local path: results JSONL (keyed by `custom_id`, order **not** guaranteed), dead-letters to `<out>.dead.jsonl`. `scheme://` URL (`s3://`/`gs://`/`az://`/`file://`/`memory://`, **needs `--features object_store`** — the default binary fails fast, before ingest): each terminal result is its own object under `<url>/results/<job>/done\|dead/<custom_id>.json`, where `<job>` is the sanitized checkpoint file stem (so distinct runs sharing one `--out` root need distinct checkpoint stems). Either way the value is recorded in the checkpoint so `resume` reuses it. Source: `cmd_run`/`is_object_url`/`object_job_id` in `forge-cli/src/main.rs`. |
 | `--checkpoint` | path | **required** | The SQLite queue/state DB (see [State & data formats](#state--data-formats)). Created if absent. |
 | `--prefix-bucket` | bool flag | off | Reorder the input by shared prompt prefix `(model, system-prompt)` before hydrating, so prefix-similar items are contiguous and the engine's automatic prefix cache (vLLM/SGLang) stays hot across a run of them. Bounded-RAM preprocessing pass (256 temp buckets beside the checkpoint, concatenated in order; only the bucket writers are open, never the corpus). Opt-in; measured ~50% wall-clock elsewhere on prefix-heavy corpora (Daft; vLLM #24320). Source: `forge_shard::bucket::bucket_jsonl`. |
@@ -149,7 +160,7 @@ engine, so unmodified OpenAI-SDK code pointed at forge runs its batch flow. Sour
 | flag | type | default | what it does |
 |---|---|---|---|
 | `--listen` | `host:port` | `127.0.0.1:8080` | Bind address for the REST server. |
-| `--data-dir` | path | **required** | Root for uploaded files (`files/`) + per-batch checkpoints & results (`batches/<id>/`). Enough persists here that a restart re-lists batches (an in-flight run task does **not** survive restart — its `ckpt.db` is intact for `forge resume`). |
+| `--data-dir` | path | **required** | Root for uploaded files (`files/`) + per-batch checkpoints & results (`batches/<id>/`). Enough persists here that a **restart resumes**: batches are re-listed, any that drained while the server was down are re-finalized, and any left in flight have their fan-out restarted from the checkpoint. Do **not** run `forge resume` against a served batch — the restarted server is already draining that `ckpt.db`, and a second coordinator on one checkpoint is exactly what the lease fencing exists to prevent. |
 | `--api-key` | string | *(none)* | Optional bearer token. When set, every route except `/v1/health` requires `Authorization: Bearer <token>`; unset = open (trust the network). |
 | `--threads` | usize | `2` | HTTP accept threads sharing the listener. |
 | *(worker flags)* | | | The [Worker/dispatch flags](#workerdispatch-flags-shared-by-run-and-resume) — the fleet every batch fans out across. |
@@ -200,8 +211,8 @@ heavy stacks are absent from it. Source: the `[features]` tables in each crate's
 
 | feature | crate | what it adds |
 |---|---|---|
-| `parquet` | `forge-store` / `forge-cli` | `forge export` + `jsonl_to_parquet` (arrow/parquet stack, Snappy-only so it still builds musl-static). |
-| `object_store` | `forge-store` / `forge-cli` | `ObjStore`: a `ResultStore` over S3/GCS/Azure/local with conditional-create idempotent writes + a `_manifest/` for O(emitted) resume. On `forge-cli` it wires the CLI: `forge run --out s3://…` (and `resume` of such a run), plus `forge cost`/`forge verify` reading `--results` from the same URL. |
+| `parquet` | `forge-store` / `forge-cli` | `forge export` + `jsonl_to_parquet` (arrow/parquet stack, Snappy-only so it still builds musl-static). An **embeddings** run additionally emits a typed `embedding: FixedSizeList<Float32, D>` column, directly loadable into a warehouse or vector DB; `D` comes from the first result carrying a vector, a dead-letter reads back NULL (never a zero vector), and a file mixing widths is an error rather than a silent truncation. A non-embedding run keeps the original schema exactly. |
+| `object_store` | `forge-store` / `forge-cli` | `ObjStore`: a `ResultStore` over S3/GCS/Azure/local with conditional-create idempotent writes + a `_manifest/` for O(emitted) resume, **and** `open_input_stream` for reading an input JSONL back out of a store. On `forge-cli` it wires the CLI: `forge run --input s3://…` and `--out s3://…` (and `resume` of such a run), plus `forge cost`/`forge verify` reading `--results` from the same URL. |
 | `governor` | `forge-worker` | `WorkerSpec::rate_limit(req_per_sec)` / `HttpWorker::with_rate_limit` — a global GCRA req/sec ceiling per worker, orthogonal to AIMD (which caps in-flight concurrency, not rate). |
 | `redb` | `forge-queue` | The pure-Rust `redb` queue backend — zero C toolchain for embedders; the CLI ships the bundled-SQLite backend. |
 

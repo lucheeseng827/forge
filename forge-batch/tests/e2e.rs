@@ -84,7 +84,10 @@ struct SlowEchoWorker {
 impl SlowEchoWorker {
     fn new(id: &str) -> Self {
         Self {
-            spec: WorkerSpec::new(id, "http://mock", EndpointKind::Chat),
+            // Concurrency 1 on purpose: with the default limit the whole batch runs in
+            // parallel and finishes inside one 200ms sleep, so a test that means to
+            // catch the server mid-flight catches nothing.
+            spec: WorkerSpec::new(id, "http://mock", EndpointKind::Chat).concurrency(1),
         }
     }
 }
@@ -588,5 +591,415 @@ async fn batches_survive_a_restart_and_relist() {
         server.shutdown();
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/metrics` is the scrape surface for a `serve-batch` deployment. Before it existed
+/// the documented way to collect forge metrics was `forge status --prometheus` on a
+/// timer — a CLI read of a checkpoint file — which cannot run in the shipped
+/// `FROM scratch` image at all, since there is no shell.
+#[tokio::test]
+async fn metrics_exposes_counters_and_gauges_and_respects_auth() {
+    let dir = tmp_dir("metrics");
+    let server = serve_batch(config(dir.clone(), Some("sk-secret".into()))).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    // Unlike /v1/health, metrics are behind the key: they carry per-status batch and
+    // item counts, which is business telemetry rather than liveness.
+    let unauth = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(unauth.status(), 401, "metrics must not be world-readable");
+
+    let resp = client
+        .get(format!("{base}/metrics"))
+        .bearer_auth("sk-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/plain"),
+        "Prometheus requires the text exposition content type"
+    );
+    let body = resp.text().await.unwrap();
+
+    // Counters carry a TYPE line naming them counters — that is what lets rate()
+    // work, and it is the whole reason this is not just `status --prometheus` again.
+    for counter in [
+        "forge_batches_created_total",
+        "forge_batches_completed_total",
+        "forge_batches_cancelled_total",
+        "forge_batches_failed_total",
+        "forge_files_uploaded_total",
+        "forge_http_requests_total",
+        "forge_http_errors_total",
+    ] {
+        assert!(
+            body.contains(&format!("# TYPE {counter} counter")),
+            "{counter} must be declared a counter, not a gauge:\n{body}"
+        );
+    }
+
+    // Every batch status is present even at zero, so a dashboard shows 0 rather than
+    // a gap before anything has failed.
+    for status in [
+        "in_progress",
+        "completed",
+        "cancelling",
+        "cancelled",
+        "failed",
+    ] {
+        assert!(
+            body.contains(&format!("forge_batches{{status=\"{status}\"}}")),
+            "missing zero-valued series for {status}:\n{body}"
+        );
+    }
+
+    // The unauthenticated attempt above must have been counted as an error.
+    let errors = body
+        .lines()
+        .find(|l| l.starts_with("forge_http_errors_total "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("forge_http_errors_total value");
+    assert!(
+        errors >= 1,
+        "the 401 should have been counted, got {errors}"
+    );
+
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── restart recovery ─────────────────────────────────────────────────────────
+
+/// A batch that was still running when the process died must actually **run again**.
+///
+/// This is the 3am case, and the pre-fix behaviour was the worst possible shape:
+/// `bootstrap` re-listed the batch with no supervisor and its persisted status still
+/// `in_progress`, so the API kept answering `in_progress` — for a job that had stopped
+/// dead. A customer's SDK polls that forever. Nothing errors, nothing alerts, and the
+/// only symptom is a number that never moves.
+#[tokio::test]
+async fn a_batch_left_in_flight_by_a_dead_process_is_resumed_on_restart() {
+    let dir = tmp_dir("restart-resume");
+    let client = reqwest::Client::new();
+    let n = 8usize;
+    let body = (0..n)
+        .map(|i| input_line(&format!("req-{i}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // First process: upload, create, and stop while it is genuinely mid-flight. The
+    // slow worker (200ms/item, 8 items) guarantees it has not drained.
+    let batch_id = {
+        let server = serve_batch(slow_config(dir.clone())).expect("serve");
+        let base = server.base_url();
+        let file: Value = client
+            .post(format!("{base}/v1/files?filename=in.jsonl"))
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let batch: Value = client
+            .post(format!("{base}/v1/batches"))
+            .json(&serde_json::json!({
+                "input_file_id": file["id"],
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(batch["status"], "in_progress");
+        // Let a little work land, then stop the process.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.shutdown();
+        batch["id"].as_str().unwrap().to_string()
+    };
+
+    // Second process over the SAME data dir — a pod restart.
+    let server = serve_batch(slow_config(dir.clone())).expect("re-serve");
+    let base = server.base_url();
+
+    // It must reach `completed` on its own. Pre-fix this loop times out with the batch
+    // pinned at `in_progress` and nothing running it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let final_status = loop {
+        let b: Value = client
+            .get(format!("{base}/v1/batches/{batch_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let st = b["status"].as_str().unwrap_or("").to_string();
+        if st == "completed" {
+            break b;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restarted server never resumed the batch: it is still {st:?} — a \
+             zombie reporting progress it will never make"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // Every item present exactly once: the resume re-hydrated idempotently and the
+    // store deduped what the first process had already written.
+    assert_eq!(final_status["request_counts"]["total"], n as u64);
+    assert_eq!(final_status["request_counts"]["completed"], n as u64);
+    let out_id = final_status["output_file_id"]
+        .as_str()
+        .expect("output file");
+    let content = client
+        .get(format!("{base}/v1/files/{out_id}/content"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let ids: std::collections::HashSet<String> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["custom_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(ids.len(), n, "every item exactly once after the restart");
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A truncated `files.json` must stop the server, not silently empty it.
+///
+/// The old loader swallowed every error and started with an EMPTY registry — and the
+/// next upload persisted that empty map, so a recoverable half-written file became the
+/// permanent loss of every file record. The uploaded bytes are still on disk; only the
+/// index mapping ids to them is gone, which is exactly the situation a human can fix
+/// and a program must not paper over.
+#[tokio::test]
+async fn a_corrupt_file_registry_refuses_to_boot_rather_than_starting_blank() {
+    let dir = tmp_dir("corrupt-registry");
+    let client = reqwest::Client::new();
+
+    let file_id = {
+        let server = serve_batch(config(dir.clone(), None)).expect("serve");
+        let base = server.base_url();
+        let file: Value = client
+            .post(format!("{base}/v1/files?filename=in.jsonl"))
+            .body(input_line("req-0"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        server.shutdown();
+        file["id"].as_str().unwrap().to_string()
+    };
+
+    // Simulate the crash-mid-write: a truncated registry.
+    let reg = dir.join("files.json");
+    let good = std::fs::read_to_string(&reg).unwrap();
+    assert!(good.contains(&file_id));
+    std::fs::write(&reg, &good[..good.len() / 2]).unwrap();
+
+    let err = match serve_batch(config(dir.clone(), None)) {
+        Err(e) => e,
+        Ok(_) => panic!("a truncated file registry must not boot as an empty one"),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("unreadable"), "name it: {msg}");
+    assert!(
+        msg.contains("permanent"),
+        "say why starting blank is worse than refusing: {msg}"
+    );
+    // And it did not rewrite the damaged file on the way out.
+    assert_eq!(std::fs::read_to_string(&reg).unwrap().len(), good.len() / 2);
+
+    // Restoring it brings the server back with the record intact.
+    std::fs::write(&reg, &good).unwrap();
+    let server = serve_batch(config(dir.clone(), None)).expect("boot after restore");
+    let base = server.base_url();
+    let obj: Value = client
+        .get(format!("{base}/v1/files/{file_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(obj["id"], file_id);
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The registry write must be atomic: no window where the file is truncated on disk.
+#[tokio::test]
+async fn the_file_registry_is_never_left_half_written() {
+    let dir = tmp_dir("atomic-registry");
+    let client = reqwest::Client::new();
+    let server = serve_batch(config(dir.clone(), None)).expect("serve");
+    let base = server.base_url();
+
+    // Every upload rewrites the whole registry; read it back after each one and assert
+    // it always parses. With a truncate-then-write there is a window where it does not.
+    for i in 0..12 {
+        client
+            .post(format!("{base}/v1/files?filename=in.jsonl"))
+            .body(input_line(&format!("req-{i}")))
+            .send()
+            .await
+            .unwrap();
+        let raw = std::fs::read(dir.join("files.json")).unwrap();
+        serde_json::from_slice::<Value>(&raw)
+            .unwrap_or_else(|e| panic!("registry not parseable after write {i}: {e}"));
+    }
+    // No temp files survive.
+    let strays: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "temp files must be renamed away, not left"
+    );
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── operator eyes ────────────────────────────────────────────────────────────
+
+/// `/v1/health` must answer the two questions a probe and a support ticket actually
+/// ask — is this process serving, and which build is it — and must NOT answer the one
+/// it has no business answering to an unauthenticated caller.
+#[tokio::test]
+async fn health_reports_build_identity_and_no_longer_leaks_the_batch_count() {
+    let dir = tmp_dir("health");
+    let server = serve_batch(config(dir.clone(), Some("k".into()))).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    // Create a batch so there IS a count that could leak.
+    let file: Value = client
+        .post(format!("{base}/v1/files?filename=in.jsonl"))
+        .header("authorization", "Bearer k")
+        .body(input_line("req-0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/v1/batches"))
+        .header("authorization", "Bearer k")
+        .json(&serde_json::json!({
+            "input_file_id": file["id"], "endpoint": "/v1/chat/completions"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // No credential at all — this route has to stay open for a load balancer.
+    let r = client
+        .get(format!("{base}/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let h: Value = r.json().await.unwrap();
+
+    assert_eq!(h["status"], "ok");
+    assert!(
+        h["build"]["version"].is_string(),
+        "which build is this? {h}"
+    );
+    assert!(
+        h["uptime_secs"].is_u64(),
+        "a resetting uptime is a crash loop: {h}"
+    );
+    assert!(
+        h.get("batches").is_none(),
+        "how much work a customer is running is business telemetry; /metrics is gated \
+         on exactly that, so answering it here made the gate decorative: {h}"
+    );
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every response carries a request id, and a caller's own id is echoed — but only
+/// after being made safe to put in a header and a log line.
+#[tokio::test]
+async fn every_response_carries_a_request_id_and_a_hostile_one_is_sanitised() {
+    let dir = tmp_dir("reqid");
+    let server = serve_batch(config(dir.clone(), None)).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    // Minted when the caller supplies none — including on a success, so "quote the
+    // request id" works for a response that was wrong rather than failed.
+    let r = client
+        .get(format!("{base}/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    let id = r
+        .headers()
+        .get("x-request-id")
+        .expect("every response carries one")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(id.starts_with("req_"), "{id}");
+
+    // A caller's trace id is echoed, so their logs join to forge's.
+    let r = client
+        .get(format!("{base}/v1/health"))
+        .header("x-request-id", "0af7651916cd43dd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers()["x-request-id"], "0af7651916cd43dd");
+
+    // …but never verbatim. Anything outside the allowlist is stripped rather than
+    // reflected into a response header and every log line for the request.
+    //
+    // (A raw CRLF or NUL cannot be tested through this client — `reqwest` refuses to
+    // *send* one — so the response-splitting and log-forging cases are covered by the
+    // unit tests in `forge_core::obs`, which call the sanitiser directly. What a real
+    // client CAN send is punctuation, which is what this asserts.)
+    let r = client
+        .get(format!("{base}/v1/health"))
+        .header("x-request-id", "trace id;with\"junk<>")
+        .send()
+        .await
+        .unwrap();
+    let echoed = r.headers()["x-request-id"].to_str().unwrap();
+    assert_eq!(echoed, "traceidwithjunk");
+    for c in [' ', ';', '"', '<', '>'] {
+        assert!(
+            !echoed.contains(c),
+            "{c:?} survived into a response header: {echoed}"
+        );
+    }
+    server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

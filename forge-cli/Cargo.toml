@@ -20,9 +20,15 @@ forge-store = { workspace = true }
 # `forge serve-batch` — the OpenAI Batch REST front door over the engine.
 forge-batch = { workspace = true }
 clap = { workspace = true }
-# `signal` (for `serve-batch`'s Ctrl-C shutdown) on top of the workspace features;
-# additive and musl-friendly.
-tokio = { workspace = true, features = ["signal"] }
+# `signal` (for `serve-batch`'s Ctrl-C shutdown) and `process` (for exec-form
+# completion hooks) on top of the workspace features; additive and musl-friendly.
+tokio = { workspace = true, features = ["signal", "process"] }
+# Completion/stall hooks POST to an http(s) URL. Already in this binary's graph via
+# forge-worker (the OpenAI-compatible client), so this adds NO new crates — it is the
+# same rustls-based client, declared directly because main.rs now calls it. The URL
+# form is not optional: the shipped image is FROM scratch, so there is no shell and no
+# curl to exec, and a webhook is the only notification that works there.
+reqwest = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

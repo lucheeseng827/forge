@@ -9,10 +9,19 @@
 
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
+# Build identity. Both are OPTIONAL and both are absent rather than guessed when
+# not supplied: a release container has no .git, and Cargo exports TARGET only to
+# build scripts (which this workspace does not have).
+ARG FORGE_GIT_SHA
+ARG FORGE_TARGET
+ENV FORGE_GIT_SHA=$FORGE_GIT_SHA FORGE_TARGET=$FORGE_TARGET
 WORKDIR /src
 COPY . .
-RUN cargo build -p forge-cli --release --locked \
-    && strip target/release/forge || true
+# No `|| true` here: `cargo build … || true` exits 0 on a FAILED build, which would
+# ship an image built from whatever was in the layer cache. Stripping is handled by
+# `strip = true` in the release profile, so there is nothing to tolerate the absence
+# of.
+RUN cargo build -p forge-cli --release --locked
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/

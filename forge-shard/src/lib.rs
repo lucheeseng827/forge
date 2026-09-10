@@ -111,6 +111,17 @@ pub fn parse_line(line: &str) -> Result<Item, ForgeError> {
             item.custom_id
         )));
     }
+    // `url` is concatenated onto the worker's base_url at dispatch, so an unvalidated
+    // value re-hosts the request (see `WorkerSpec::request_url`). Rejecting it HERE is
+    // the friendly half: the offending line lands in the reject sidecar with a
+    // readable reason instead of dead-lettering later. `request_url` enforces the same
+    // predicate at dispatch, which is the half that cannot be bypassed.
+    if !forge_core::valid_item_url(&item.url) {
+        return Err(ForgeError::Ingest(format!(
+            "invalid url {:?} (expected empty, or an absolute path like \"/v1/chat/completions\")",
+            item.url
+        )));
+    }
     Ok(item)
 }
 
@@ -182,7 +193,38 @@ pub async fn ingest_jsonl_with_rejects<Q: Queue>(
         }
     }
 
-    let mut reader = BufReader::new(file);
+    ingest_reader_with_rejects(
+        queue,
+        BufReader::new(file),
+        start_offset,
+        start_line,
+        reject_path,
+    )
+    .await
+}
+
+/// Hydrate `queue` from an already-positioned reader.
+///
+/// This is the body of [`ingest_jsonl_with_rejects`] with the file-opening and seeking
+/// lifted out, so an input that does not live on a local disk — an object-store URL,
+/// say — can reuse the identical streaming, batching, reject-sidecar and `Shard`
+/// bookkeeping instead of growing a parallel implementation that drifts.
+///
+/// The caller owns positioning: it must pass the `start_offset` / `start_line` the
+/// reader is actually positioned at (from [`Queue::hydrated_through`]), because those
+/// values are recorded verbatim in the `Shard` bookkeeping that makes a re-run seek
+/// instead of rescan. Passing offsets that do not match the reader corrupts resume.
+///
+/// Nothing here depends on the source being seekable or on knowing its length, which
+/// is what lets a plain byte stream drive it.
+pub async fn ingest_reader_with_rejects<Q: Queue, R: tokio::io::AsyncBufRead + Unpin>(
+    queue: &Q,
+    reader: R,
+    start_offset: u64,
+    start_line: u64,
+    reject_path: Option<impl AsRef<Path>>,
+) -> Result<IngestStats, ForgeError> {
+    let mut reader = reader;
     let mut rejects = reject_path.map(|p| RejectSink::new(p.as_ref().to_path_buf()));
 
     let mut stats = IngestStats::default();
@@ -702,5 +744,288 @@ mod tests {
         assert_eq!(stats.written, 0);
         assert_eq!(stats.rejected, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Statistics from [`subset_jsonl`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SubsetStats {
+    /// Ids loaded from the id file.
+    pub ids_loaded: u64,
+    /// Input lines read.
+    pub lines_read: u64,
+    /// Lines written to the output.
+    pub written: u64,
+    /// Ids that were listed but never appeared in the input — almost always a sign
+    /// the id file and the input do not belong to the same job.
+    pub ids_unmatched: u64,
+    /// Lines skipped because they could not be parsed / had no usable `custom_id`.
+    pub unparsable: u64,
+}
+
+/// Read an id list from `path`. Accepts BOTH sidecar shapes forge itself emits, so an
+/// operator never has to reshape one:
+///
+/// - bare ids, one per line (`<results>.missing.txt` from `forge verify`);
+/// - JSONL records carrying `custom_id` (`<out>.dead.jsonl` from the store).
+///
+/// Detection is per line: a line starting with `{` is parsed as JSON, anything else is
+/// taken verbatim. Blank lines and `#` comments are ignored, so a hand-edited list works.
+pub async fn load_ids(path: impl AsRef<Path>) -> Result<HashSet<String>, ForgeError> {
+    let f = File::open(path.as_ref()).await?;
+    let mut lines = BufReader::new(f).lines();
+    let mut ids = HashSet::new();
+    while let Some(line) = lines.next_line().await? {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+                if let Some(id) = v.get("custom_id").and_then(|c| c.as_str()) {
+                    ids.insert(id.to_string());
+                    continue;
+                }
+            }
+            // A `{`-leading line we cannot read is a malformed record, not an id.
+            continue;
+        }
+        ids.insert(t.to_string());
+    }
+    Ok(ids)
+}
+
+/// Filter `input` down to the lines whose `custom_id` is (or, with `invert`, is not)
+/// in `ids_path`, writing them to `out`.
+///
+/// This is the return leg of a partly-failed run: `forge verify` and the dead-letter
+/// sidecar tell you *which* ids have no good result, and this turns that list back
+/// into a runnable input JSONL. Without it the documented procedure is to hand-write
+/// a shell join, which is the worst thing to be doing right after a large run failed.
+///
+/// **It is a file filter and nothing more.** It creates no item relationship, records
+/// no state, schedules nothing, and has no opinion about what runs next — the operator
+/// runs `forge run` on the output with a fresh checkpoint if they want to. That is
+/// what keeps it on the correct side of the no-DAG boundary: the same category as
+/// [`import_batch`], not a retry policy.
+///
+/// Memory is bounded by the ID LIST, not by the input: the input streams, but the id
+/// set is resident. That is the right trade here — the list is the failures, which is
+/// a small fraction of a large job — but a list of 50M ids will cost real RAM.
+pub async fn subset_jsonl(
+    input: impl AsRef<Path>,
+    ids_path: impl AsRef<Path>,
+    out: impl AsRef<Path>,
+    invert: bool,
+) -> Result<SubsetStats, ForgeError> {
+    // The same destructive footgun `import_batch` guards at :428 — `File::create(out)`
+    // truncates before the read loop finishes, so subsetting a file onto itself would
+    // silently wipe the source. This one shipped without the guard.
+    if same_file(input.as_ref(), out.as_ref()) {
+        return Err(ForgeError::Ingest(format!(
+            "refusing to subset {} onto itself (--input and --out are the same file)",
+            input.as_ref().display()
+        )));
+    }
+    let ids = load_ids(ids_path).await?;
+    let mut stats = SubsetStats {
+        ids_loaded: ids.len() as u64,
+        ..Default::default()
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    let f = File::open(input.as_ref()).await?;
+    let mut lines = BufReader::new(f).lines();
+    let out_file = File::create(out.as_ref()).await?;
+    let mut w = BufWriter::new(out_file);
+
+    while let Some(line) = lines.next_line().await? {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        stats.lines_read += 1;
+        // Only the id is needed, so parse to Value rather than a full Item — a line
+        // this tool is asked to carry through should not have to satisfy Item's schema.
+        let Some(id) = serde_json::from_str::<serde_json::Value>(t)
+            .ok()
+            .and_then(|v| {
+                v.get("custom_id")
+                    .or_else(|| v.get("recordId"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+        else {
+            stats.unparsable += 1;
+            continue;
+        };
+        let listed = ids.contains(&id);
+        if listed {
+            if let Some(k) = ids.get(&id) {
+                seen.insert(k.as_str());
+            }
+        }
+        if listed != invert {
+            w.write_all(line.as_bytes()).await?;
+            w.write_all(b"\n").await?;
+            stats.written += 1;
+        }
+    }
+    w.flush().await?;
+    stats.ids_unmatched = stats.ids_loaded - seen.len() as u64;
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod subset_tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("forge-subset-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn line(id: &str) -> String {
+        format!(
+            r#"{{"custom_id":"{id}","method":"POST","url":"/v1/chat/completions","body":{{"model":"m"}}}}"#
+        )
+    }
+
+    async fn run(d: &Path, ids_body: &str, invert: bool) -> (SubsetStats, String) {
+        let input = d.join("in.jsonl");
+        let ids = d.join("ids.txt");
+        let out = d.join("out.jsonl");
+        std::fs::write(
+            &input,
+            format!("{}\n{}\n{}\n", line("a"), line("b"), line("c")),
+        )
+        .unwrap();
+        std::fs::write(&ids, ids_body).unwrap();
+        let stats = subset_jsonl(&input, &ids, &out, invert).await.unwrap();
+        (stats, std::fs::read_to_string(&out).unwrap())
+    }
+
+    #[tokio::test]
+    async fn selects_listed_ids_from_a_bare_id_list() {
+        // The `.missing.txt` shape that `forge verify` writes.
+        let d = dir("bare");
+        let (stats, out) = run(&d, "a\nc\n", false).await;
+        assert_eq!(stats.written, 2);
+        assert_eq!(stats.lines_read, 3);
+        assert_eq!(stats.ids_unmatched, 0);
+        assert!(out.contains(r#""custom_id":"a""#));
+        assert!(out.contains(r#""custom_id":"c""#));
+        assert!(!out.contains(r#""custom_id":"b""#));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn accepts_the_dead_letter_jsonl_shape_directly() {
+        // The whole point: an operator must not have to reshape `.dead.jsonl` by hand.
+        let d = dir("dead");
+        let dead = format!(
+            "{}\n{}\n",
+            r#"{"custom_id":"b","error":{"code":"worker_error","message":"boom"},"usage":{},"worker_id":"w","latency_ms":1,"attempt":3,"completed_at":0}"#,
+            "# a hand-added comment"
+        );
+        let (stats, out) = run(&d, &dead, false).await;
+        assert_eq!(stats.ids_loaded, 1);
+        assert_eq!(stats.written, 1);
+        assert!(out.contains(r#""custom_id":"b""#));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn invert_excludes_the_listed_ids() {
+        let d = dir("invert");
+        let (stats, out) = run(&d, "a\n", true).await;
+        assert_eq!(stats.written, 2);
+        assert!(!out.contains(r#""custom_id":"a""#));
+        assert!(out.contains(r#""custom_id":"b""#));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn an_id_absent_from_the_input_is_counted_not_silently_dropped() {
+        // Mixing up two jobs' files is the likely operator error here, and a silently
+        // short output would send them off to re-run the wrong work.
+        let d = dir("unmatched");
+        let (stats, _) = run(&d, "a\nzzz\n", false).await;
+        assert_eq!(stats.ids_loaded, 2);
+        assert_eq!(stats.written, 1);
+        assert_eq!(stats.ids_unmatched, 1, "the absent id must be reported");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn the_output_is_runnable_input_again() {
+        // A subset must round-trip through the normal ingest path, or it is useless.
+        let d = dir("roundtrip");
+        let (_, _) = run(&d, "a\nb\n", false).await;
+        let out = d.join("out.jsonl");
+        for l in std::fs::read_to_string(&out).unwrap().lines() {
+            parse_line(l).expect("every emitted line must ingest as an Item");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod url_guard_tests {
+    use super::*;
+
+    #[test]
+    fn ingest_rejects_a_rehosting_url_with_a_readable_reason() {
+        let line = r#"{"custom_id":"req-1","method":"POST","url":"@attacker.example.com/v1/chat/completions","body":{}}"#;
+        let err = parse_line(line).expect_err("a re-hosting url must not ingest");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid url"), "unhelpful message: {msg}");
+        assert!(msg.contains("absolute path"), "unhelpful message: {msg}");
+    }
+
+    #[test]
+    fn ingest_still_accepts_the_documented_line() {
+        let line = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}"#;
+        let item = parse_line(line).expect("the documented shape must still ingest");
+        assert_eq!(item.url, "/v1/chat/completions");
+
+        // And a blank url (worker endpoint default) is still fine.
+        let blank = r#"{"custom_id":"req-2","body":{"model":"m"}}"#;
+        assert_eq!(parse_line(blank).unwrap().url, "");
+    }
+}
+
+#[cfg(test)]
+mod subset_self_write {
+    use super::*;
+
+    /// `--out` equal to `--input` must be refused, not silently wipe the source.
+    ///
+    /// `File::create` truncates, and the read loop is still streaming the same file, so
+    /// without the guard the run "succeeds" against an input that is now empty. That is
+    /// the whole batch gone, and the only copy of it.
+    #[tokio::test]
+    async fn subsetting_a_file_onto_itself_is_refused_before_anything_is_written() {
+        let d = std::env::temp_dir().join(format!("forge-subset-self-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let input = d.join("in.jsonl");
+        let body = "{\"custom_id\":\"a\",\"body\":{}}\n{\"custom_id\":\"b\",\"body\":{}}\n";
+        std::fs::write(&input, body).unwrap();
+        let ids = d.join("ids.txt");
+        std::fs::write(&ids, "a\n").unwrap();
+
+        let err = subset_jsonl(&input, &ids, &input, false)
+            .await
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("onto itself"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&input).unwrap(),
+            body,
+            "the source must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

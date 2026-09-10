@@ -285,6 +285,33 @@ fn cooldown_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     cooldown.map(|c| c.min(MAX_COOLDOWN))
 }
 
+/// The API key for one worker: `FORGE_WORKER_API_KEY_<WORKER_ID>` if set, else the
+/// global `FORGE_WORKER_API_KEY`.
+///
+/// The id is normalized the way environment variables have to be — upper-cased, with
+/// every non-alphanumeric byte replaced by `_` — so a worker named `gpu-1` reads
+/// `FORGE_WORKER_API_KEY_GPU_1`.
+fn worker_api_key(worker_id: &str) -> Result<String, std::env::VarError> {
+    // BYTES, not chars — `docs/CONFIG.md` documents "every non-alphanumeric byte → `_`",
+    // and `chars()` disagreed for any non-ASCII id: `gpué` mapped to `GPU_` where the
+    // documented rule gives `GPU__`. An operator following the docs would export a name
+    // the lookup never tries, and the miss falls back to the GLOBAL key — which in a
+    // two-provider fleet is the other provider's key. That silent fallback is the exact
+    // thing per-worker keys exist to prevent.
+    let suffix: String = worker_id
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b.to_ascii_uppercase() as char
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::var(format!("FORGE_WORKER_API_KEY_{suffix}"))
+        .or_else(|_| std::env::var("FORGE_WORKER_API_KEY"))
+}
+
 impl HttpWorker {
     /// Arm the shared cooldown to `now + d` if that is later than the current arm
     /// (monotonic max — a stronger signal never gets shortened by a weaker later one
@@ -318,9 +345,17 @@ impl HttpWorker {
     /// `FORGE_WORKER_API_KEY` to drive a hosted endpoint: the OpenAI-compatible
     /// hints send it as `Authorization: Bearer`, the Anthropic hint as `x-api-key`
     /// plus the required `anthropic-version` header.
+    ///
+    /// **Per-worker keys.** `FORGE_WORKER_API_KEY_<WORKER_ID>` (id upper-cased, any
+    /// non-alphanumeric byte becoming `_`) wins over the global variable for that one
+    /// worker. Without this a single run cannot span two hosted providers, because one
+    /// process-global key cannot be both an OpenAI key and an Anthropic key — which is
+    /// exactly the fleet you want when spilling from a dying spot fleet onto a hosted
+    /// endpoint. The global variable remains the fallback, so existing single-provider
+    /// setups are untouched.
     pub fn new(spec: WorkerSpec) -> Result<Self, ForgeError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(key) = std::env::var("FORGE_WORKER_API_KEY") {
+        if let Ok(key) = worker_api_key(&spec.worker_id) {
             if !key.is_empty() && spec.engine_hint.is_hosted() {
                 use reqwest::header::{HeaderName, HeaderValue};
                 let mut put = |name: &'static str, value: String| -> Result<(), ForgeError> {
@@ -577,7 +612,9 @@ impl Worker for HttpWorker {
             rl.until_ready().await;
         }
 
-        let url = self.spec.request_url(&item.url);
+        // Validated at the dispatch boundary: a bad `url` is a terminal item error,
+        // never an outbound request. See `WorkerSpec::request_url`.
+        let url = self.spec.request_url(&item.url)?;
         // Validate against the *item's* endpoint (a run may carry a per-line mix of
         // chat / completions / embeddings), falling back to the worker's declared
         // kind when the item left `url` blank.
@@ -622,15 +659,21 @@ impl Worker for HttpWorker {
                             // `usage` is captured free from every response body —
                             // parsed per the *item's* endpoint shape, so Anthropic
                             // Messages tokens price identically in `forge cost`.
-                            let usage = body
-                                .get("usage")
-                                .map(|u| match kind {
+                            let usage = match body.get("usage") {
+                                Some(u) => match kind {
                                     EndpointKind::Messages => {
                                         forge_core::TokenUsage::from_anthropic_usage(u)
                                     }
                                     _ => forge_core::TokenUsage::from_openai_usage(u),
-                                })
-                                .unwrap_or_default();
+                                },
+                                // No `usage` object at all. Some engines — llama.cpp's
+                                // native completion route — report token counts at the
+                                // TOP LEVEL of the response instead, so parse the body
+                                // itself rather than defaulting to zero and silently
+                                // zeroing the cost ledger. A body with no counts
+                                // anywhere still yields zeros, exactly as before.
+                                None => forge_core::TokenUsage::from_openai_usage(&body),
+                            };
                             return Ok(ItemResult {
                                 custom_id: item.custom_id.clone(),
                                 response: Some(ItemResponse {
@@ -1326,5 +1369,144 @@ vllm:num_requests_waiting{model_name=\"x\"} 7.0
         }
         assert_eq!(w.inflight.effective(), 4, "AIMD untouched by the rate gate");
         assert_eq!(w.inflight.debt(), 0);
+    }
+}
+
+#[cfg(test)]
+mod per_worker_key_tests {
+    use super::*;
+    use forge_core::{EndpointKind, EngineHint};
+
+    /// Env vars are process-global, so these run under one lock and clean up after
+    /// themselves rather than racing each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hosted(id: &str) -> WorkerSpec {
+        WorkerSpec::new(id, "https://api.example.com/v1", EndpointKind::Chat)
+            .engine_hint(EngineHint::OpenAiApi)
+    }
+
+    #[test]
+    fn a_per_worker_key_overrides_the_global_one() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("FORGE_WORKER_API_KEY", "global");
+        std::env::set_var("FORGE_WORKER_API_KEY_SPILL", "specific");
+
+        assert_eq!(worker_api_key("spill").unwrap(), "specific");
+        // A worker with no key of its own still gets the global one, so a
+        // single-provider fleet behaves exactly as before.
+        assert_eq!(worker_api_key("gpu1").unwrap(), "global");
+
+        std::env::remove_var("FORGE_WORKER_API_KEY");
+        std::env::remove_var("FORGE_WORKER_API_KEY_SPILL");
+    }
+
+    #[test]
+    fn the_id_is_normalized_the_way_env_vars_must_be() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `gpu-1` cannot appear verbatim in a variable name, so it becomes GPU_1.
+        std::env::set_var("FORGE_WORKER_API_KEY_GPU_1", "dashed");
+        assert_eq!(worker_api_key("gpu-1").unwrap(), "dashed");
+        assert_eq!(worker_api_key("GPU.1").unwrap(), "dashed");
+        std::env::remove_var("FORGE_WORKER_API_KEY_GPU_1");
+    }
+
+    #[test]
+    fn two_hosted_workers_can_hold_different_keys_in_one_fleet() {
+        // The point of the whole feature: one process-global key cannot be both an
+        // OpenAI key and an Anthropic key, so without per-worker keys a run could not
+        // span two hosted providers — which is exactly the spill-to-hosted fleet.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("FORGE_WORKER_API_KEY");
+        std::env::set_var("FORGE_WORKER_API_KEY_OAI", "sk-openai");
+        std::env::set_var("FORGE_WORKER_API_KEY_ANT", "sk-anthropic");
+
+        assert_eq!(worker_api_key("oai").unwrap(), "sk-openai");
+        assert_eq!(worker_api_key("ant").unwrap(), "sk-anthropic");
+        // A third worker with neither gets nothing rather than borrowing a neighbour's.
+        assert!(worker_api_key("gpu1").is_err());
+
+        // And both build into real workers carrying their own headers.
+        assert!(HttpWorker::new(hosted("oai")).is_ok());
+        assert!(HttpWorker::new(hosted("ant")).is_ok());
+
+        std::env::remove_var("FORGE_WORKER_API_KEY_OAI");
+        std::env::remove_var("FORGE_WORKER_API_KEY_ANT");
+    }
+}
+
+#[cfg(test)]
+mod engine_shape_tests {
+    use super::*;
+    use forge_core::{EndpointKind, EngineHint, Item, ItemState};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn item(url: &str) -> Item {
+        Item {
+            custom_id: "req-1".into(),
+            method: "POST".into(),
+            url: url.into(),
+            body: serde_json::json!({"prompt": "hi"}),
+            status: ItemState::Pending,
+            attempts: 0,
+            leased_until: None,
+            leased_by: None,
+            last_error: None,
+        }
+    }
+
+    /// llama.cpp's native completion route reports token counts at the TOP LEVEL of
+    /// the response, with its own field names, and no `usage` object at all. Both
+    /// facts were documented as supported and neither was handled, so a llama.cpp run
+    /// recorded zero tokens — silently zeroing the ledger `forge cost` invoices from.
+    #[tokio::test]
+    async fn llamacpp_native_response_still_bills_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completion"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": "hello",
+                "tokens_evaluated": 42,
+                "tokens_predicted": 8,
+                "stop": true,
+            })))
+            .mount(&server)
+            .await;
+
+        let spec = WorkerSpec::new("llama", server.uri(), EndpointKind::Completions)
+            .engine_hint(EngineHint::LlamaCpp);
+        let w = HttpWorker::new(spec).unwrap();
+        let r = w.submit(&item("/completion")).await.unwrap();
+
+        assert_eq!(r.usage.prompt_tokens, 42, "prompt tokens must not be zero");
+        assert_eq!(r.usage.completion_tokens, 8);
+        assert_eq!(r.usage.total_tokens, 50, "derived, not billed as zero");
+    }
+
+    /// The standard shape must be untouched by that fallback.
+    #[tokio::test]
+    async fn a_normal_openai_usage_object_is_unaffected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+            })))
+            .mount(&server)
+            .await;
+
+        let spec = WorkerSpec::new("vllm", server.uri(), EndpointKind::Chat);
+        let w = HttpWorker::new(spec).unwrap();
+        let r = w.submit(&item("/v1/chat/completions")).await.unwrap();
+        assert_eq!(
+            (
+                r.usage.prompt_tokens,
+                r.usage.completion_tokens,
+                r.usage.total_tokens
+            ),
+            (3, 4, 7)
+        );
     }
 }

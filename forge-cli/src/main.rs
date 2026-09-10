@@ -7,19 +7,153 @@
 //! forge is a batch-inference work distributor — it has no DAG, cron, or fleet
 //! provisioning.
 
+mod hooks;
+
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use forge_batch::{serve_batch, BatchConfig, HttpFleet};
 use forge_core::{
-    compute_cost, BatchRun, CostInputs, EndpointKind, EngineHint, JobTotals, Queue, ResponseCheck,
-    RetryPolicy, RunConfig, WorkerSpec,
+    compute_cost, BatchRun, CostInputs, EndpointKind, EngineHint, ForgeError, JobTotals, Queue,
+    ResponseCheck, RetryPolicy, RunConfig, WorkerSpec,
 };
 use forge_queue::SqliteQueue;
 use forge_store::JsonlStore;
 use forge_worker::HttpWorker;
+
+/// One `--workers` entry, resolved.
+struct ParsedWorker {
+    id: String,
+    url: String,
+    engine: Option<EngineArg>,
+}
+
+/// Parse a `--workers` entry: `[name=][engine:]url`.
+///
+/// Three shapes, in increasing specificity — the first is what every existing
+/// invocation already writes, so nothing breaks:
+///
+/// - `http://gpu1:8000`                — fleet-wide `--engine`, auto id `w0`
+/// - `sglang:http://gpu1:8000`         — this worker overrides the engine hint
+/// - `spill=openai-api:https://api…`   — named, so it can take its own API key
+///   via `FORGE_WORKER_API_KEY_SPILL`
+///
+/// **Why the engine prefix is unambiguous.** A URL contains a colon
+/// (`http://…`), so splitting on the first one is only safe because the prefix is
+/// accepted *only* when it names a known engine. `http` is not an engine, so
+/// `http://gpu1:8000` parses as a bare URL — the check is what makes the syntax work
+/// rather than a guess about how many colons a URL has.
+///
+/// The name, when given, becomes the `worker_id`: it shows up in every result line
+/// and in the load-aware dispatch logs, and it selects that worker's API key.
+fn parse_worker_entry(index: usize, entry: &str) -> anyhow::Result<ParsedWorker> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err(ForgeError::Config("empty --workers entry".into()).into());
+    }
+
+    // `name=` prefix. Split on the FIRST `=`, which cannot appear in the scheme or
+    // host of a URL (a query string can hold one, but that follows a `?`).
+    let (name, rest) = match entry.split_once('=') {
+        Some((n, r)) if !n.is_empty() && !n.contains("//") && !n.contains(':') => {
+            (Some(n.trim().to_string()), r.trim())
+        }
+        _ => (None, entry),
+    };
+
+    // `engine:` prefix — accepted only when the prefix names a known engine.
+    let (engine, url) = match rest.split_once(':') {
+        Some((maybe_engine, tail)) => match EngineArg::from_str_name(maybe_engine) {
+            Some(e) => (Some(e), tail.to_string()),
+            None => (None, rest.to_string()),
+        },
+        None => (None, rest.to_string()),
+    };
+
+    // An engine prefix consumed a colon, so what follows must still be a full URL.
+    // Catching this here gives a usable message instead of a confusing connection
+    // failure to a host called "gpu1".
+    if engine.is_some() && !url.contains("://") {
+        return Err(ForgeError::Config(format!(
+            "--workers entry {entry:?}: after the engine prefix, {url:?} is not a URL \
+             (expected something like `sglang:http://host:8000`)"
+        ))
+        .into());
+    }
+
+    if url.is_empty() {
+        return Err(ForgeError::Config(format!("--workers entry {entry:?} has no URL")).into());
+    }
+
+    Ok(ParsedWorker {
+        id: name.unwrap_or_else(|| format!("w{index}")),
+        url,
+        engine,
+    })
+}
+
+/// Process exit codes. **This is a stability contract**, not an implementation
+/// detail: orchestrators (Airflow, Dagster, Argo, a CronJob) branch on these, and an
+/// automated retry decision depends on telling them apart. Adding a code is a minor
+/// change; changing what an existing one means is breaking.
+///
+/// The distinction that matters operationally is `Incomplete` vs `Usage`: retrying an
+/// incomplete run is correct and cheap (`forge resume` picks up where it stopped),
+/// while retrying a malformed input burns the same GPU minutes to fail identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// Everything terminal and successful. Nothing to do.
+    Complete = 0,
+    /// A run-time failure (I/O, worker, store). Generic; retry at the operator's risk.
+    Failed = 1,
+    /// Work remains — items still pending or leased. **`forge resume` is the correct
+    /// response**, and it is expected to succeed.
+    Incomplete = 2,
+    /// Bad configuration or bad input. Retrying is pointless; a human must change
+    /// something. Never retry on this code.
+    Usage = 3,
+    /// Every item reached a terminal state, but some dead-lettered. The run is
+    /// finished — this is a success with a caveat, not a failure — but a pipeline
+    /// usually wants to alert.
+    DeadLetters = 4,
+}
+
+impl From<Exit> for ExitCode {
+    fn from(e: Exit) -> Self {
+        ExitCode::from(e as u8)
+    }
+}
+
+impl Exit {
+    /// Classify a run's totals. Incompleteness outranks dead-letters: if work remains,
+    /// the actionable next step is `resume`, whatever else happened.
+    fn from_totals(t: &JobTotals) -> Self {
+        if t.items_done + t.items_dead < t.items_total {
+            Exit::Incomplete
+        } else if t.items_dead > 0 {
+            Exit::DeadLetters
+        } else {
+            Exit::Complete
+        }
+    }
+}
+
+/// Map an error to an exit code. `Config` and `Ingest` are the "you gave me something
+/// wrong" family, and are the ones a pipeline must not retry.
+fn exit_for_error(err: &anyhow::Error) -> Exit {
+    match err.downcast_ref::<ForgeError>() {
+        Some(ForgeError::Config(_)) | Some(ForgeError::Ingest(_)) => Exit::Usage,
+        // A file that is not there will not be there on the retry either — an
+        // orchestrator that treats this as transient burns a slot to fail identically.
+        Some(ForgeError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Exit::Usage,
+        _ => Exit::Failed,
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -28,6 +162,17 @@ use forge_worker::HttpWorker;
     about = "Offline/batch inference coordinator — fan a giant JSONL across N workers: any OpenAI-compatible engine (vLLM/SGLang/llama.cpp/…) or hosted provider endpoint. NOT a workflow/DAG scheduler."
 )]
 struct Cli {
+    /// Log rendering: `text` for a terminal, `json` for a log shipper (one object per
+    /// line). Also settable as `FORGE_LOG_FORMAT`, which is what a Deployment sets once
+    /// rather than on every command. `RUST_LOG` still selects levels; this only changes
+    /// how they are printed.
+    ///
+    /// The env var is read by hand rather than through clap's `env` feature: that
+    /// feature renders `[env: VAR=<value>]` into `--help` for every argument that uses
+    /// it, which is how a secret ended up in help output once already. Not worth
+    /// enabling repo-wide for one cosmetic knob.
+    #[arg(long, global = true)]
+    log_format: Option<forge_core::LogFormat>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -46,8 +191,17 @@ enum Cmd {
     Audit(AuditArgs),
     /// Re-queue leased-but-no-result items (expired leases), then exit.
     Sweep(SweepArgs),
+    /// Put dead-lettered items back on the queue of the SAME checkpoint, and prune
+    /// their records from `<out>.dead.jsonl` so the re-run's results are actually
+    /// kept. Terminal state is reversed deliberately and only for items you name;
+    /// nothing is scheduled and no item relationship is created.
+    Requeue(RequeueArgs),
     /// Normalize an OpenAI/Anthropic/Bedrock batch file into forge-native JSONL.
     Import(ImportArgs),
+    /// Filter an input JSONL down to a list of `custom_id`s — the return leg after a
+    /// partly-failed run. Takes `verify`'s `.missing.txt` or the store's `.dead.jsonl`
+    /// directly. A stateless file filter: it schedules nothing and records nothing.
+    Subset(SubsetArgs),
     /// Report the cost arbitrage (forge $/Mtok, tokens/$, $ saved vs online) from a
     /// results file's real token usage.
     Cost(CostArgs),
@@ -64,10 +218,85 @@ enum Cmd {
     Export(ExportArgs),
 }
 
+impl Cmd {
+    /// The subcommand's name, for the startup log line.
+    fn name(&self) -> &'static str {
+        match self {
+            Cmd::Run(_) => "run",
+            Cmd::Resume(_) => "resume",
+            Cmd::Status(_) => "status",
+            Cmd::Audit(_) => "audit",
+            Cmd::Sweep(_) => "sweep",
+            Cmd::Requeue(_) => "requeue",
+            Cmd::Import(_) => "import",
+            Cmd::Subset(_) => "subset",
+            Cmd::Cost(_) => "cost",
+            Cmd::Verify(_) => "verify",
+            Cmd::ServeBatch(_) => "serve-batch",
+            #[cfg(feature = "parquet")]
+            Cmd::Export(_) => "export",
+        }
+    }
+}
+
+/// Outbound notification knobs, shared by `run` and `resume`.
+///
+/// These are **outbound only** — forge reporting on its own run. They are not the
+/// inbound cron/triggers `README.md` rules out: nothing here decides what runs next.
+/// See `hooks.rs` for the boundary argument in full.
+#[derive(clap::Args, Clone, Debug)]
+struct HookArgs {
+    /// Notify when the run reaches a terminal state. Either an `http(s)://` URL (the
+    /// JSON status is POSTed — the only form that works in the `FROM scratch` image,
+    /// which has no shell) or a program to execute with the JSON on stdin.
+    #[arg(long, value_name = "URL_OR_COMMAND")]
+    on_complete: Option<String>,
+    /// Notify once if the run stops making progress for `--stall-secs`. This is the
+    /// 02:00 case: a spot fleet died and nobody is watching.
+    #[arg(long, value_name = "URL_OR_COMMAND")]
+    on_stall: Option<String>,
+    /// Seconds without a newly-terminal item before `--on-stall` fires. Only read
+    /// when `--on-stall` is set.
+    #[arg(long, default_value_t = 900)]
+    stall_secs: u64,
+}
+
+impl HookArgs {
+    fn complete_hook(&self) -> anyhow::Result<Option<hooks::Hook>> {
+        self.on_complete
+            .as_deref()
+            .map(|t| {
+                hooks::Hook::parse(t).map_err(|e| ForgeError::Config(format!("--on-complete: {e}")))
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn stall_hook(&self) -> anyhow::Result<Option<hooks::Hook>> {
+        self.on_stall
+            .as_deref()
+            .map(|t| {
+                hooks::Hook::parse(t).map_err(|e| ForgeError::Config(format!("--on-stall: {e}")))
+            })
+            .transpose()
+            .map_err(Into::into)
+    }
+}
+
 /// Worker fleet + dispatch knobs, shared by `run` and `resume`.
 #[derive(clap::Args)]
 struct WorkerArgs {
-    /// Comma-separated OpenAI-compatible base URLs (BYO endpoints).
+    /// Comma-separated worker entries: `[name=][engine:]url`.
+    ///
+    /// A bare URL uses the fleet-wide `--engine`. Prefix an entry with an engine name
+    /// to override it for that worker only, and with `name=` to set its worker id —
+    /// which appears in every result line and selects that worker's API key via
+    /// `FORGE_WORKER_API_KEY_<NAME>` (falling back to `FORGE_WORKER_API_KEY`).
+    ///
+    /// One run can therefore span a self-hosted fleet and a hosted API, which is what
+    /// lets work spill onto a hosted endpoint when spot capacity disappears:
+    ///
+    ///   --workers 'http://gpu1:8000,sglang:http://gpu2:8000,spill=openai-api:https://api.openai.com/v1'
     #[arg(long, value_delimiter = ',', required = true)]
     workers: Vec<String>,
     /// Engine behind the workers (health-probe shape / concurrency knob only).
@@ -147,6 +376,8 @@ struct RunArgs {
     prefix_bucket: bool,
     #[command(flatten)]
     workers: WorkerArgs,
+    #[command(flatten)]
+    hooks: HookArgs,
 }
 
 #[derive(clap::Args)]
@@ -162,6 +393,8 @@ struct ResumeArgs {
     checkpoint: PathBuf,
     #[command(flatten)]
     workers: WorkerArgs,
+    #[command(flatten)]
+    hooks: HookArgs,
 }
 
 #[derive(clap::Args)]
@@ -211,6 +444,62 @@ struct AuditArgs {
 struct SweepArgs {
     #[arg(long)]
     checkpoint: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct RequeueArgs {
+    /// The run's checkpoint. Items go back on THIS queue — the point of the command is
+    /// to keep the job, its ingest checkpoint and its results file intact, rather than
+    /// starting a second job whose output you then have to merge.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// The run's results file, exactly as passed to `run --out`. Its sibling
+    /// `<out>.dead.jsonl` is what gets pruned.
+    ///
+    /// **Required, and not inferable.** The store seeds its emitted-id set from the
+    /// dead-letter file, so an item requeued while its dead record still stands is
+    /// re-leased, re-run against a real GPU, and has its fresh result silently
+    /// discarded. Requeueing without pruning is not a partial success; it is a way to
+    /// spend money and get nothing.
+    #[arg(long)]
+    out: PathBuf,
+    /// Requeue only these ids. Accepts either shape forge emits: bare ids one per line
+    /// (`verify`'s `.missing.txt`) or JSONL records carrying `custom_id` (the store's
+    /// `.dead.jsonl`) — the same input `subset` takes.
+    #[arg(long, conflicts_with_all = ["all", "reason"])]
+    ids: Option<PathBuf>,
+    /// Requeue every dead-lettered item in the checkpoint.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["ids", "reason"])]
+    all: bool,
+    /// Requeue only dead-letters whose recorded error contains this substring — e.g.
+    /// `--reason timeout` after fixing an engine that was falling over, while leaving
+    /// the HTTP 4xx items (bad requests, which retrying cannot fix) quarantined.
+    #[arg(long, conflicts_with_all = ["ids", "all"])]
+    reason: Option<String>,
+    /// Print what would be requeued and change nothing.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    /// Machine-readable JSON output.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct SubsetArgs {
+    /// The original input JSONL to filter.
+    #[arg(long)]
+    input: PathBuf,
+    /// Ids to select. Accepts either shape forge emits: bare ids one per line
+    /// (`forge verify`'s `.missing.txt`) or JSONL records carrying `custom_id`
+    /// (the store's `.dead.jsonl`). Blank lines and `#` comments are ignored.
+    #[arg(long)]
+    ids: PathBuf,
+    /// Where to write the filtered JSONL.
+    #[arg(long)]
+    out: PathBuf,
+    /// Emit the lines NOT in the id list, instead of the ones that are.
+    #[arg(long, default_value_t = false)]
+    invert: bool,
 }
 
 #[derive(clap::Args)]
@@ -319,6 +608,22 @@ enum EngineArg {
     AnthropicApi,
 }
 
+impl EngineArg {
+    /// Match a `--workers` engine prefix. Kept in lockstep with the clap value names
+    /// so `sglang:` and `--engine sglang` mean the same thing.
+    fn from_str_name(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "vllm" => EngineArg::Vllm,
+            "sglang" => EngineArg::Sglang,
+            "llamacpp" | "llama-cpp" | "llama_cpp" => EngineArg::Llamacpp,
+            "router" => EngineArg::Router,
+            "openai-api" | "openai_api" | "openai" => EngineArg::OpenaiApi,
+            "anthropic-api" | "anthropic_api" | "anthropic" => EngineArg::AnthropicApi,
+            _ => return None,
+        })
+    }
+}
+
 impl From<EngineArg> for EngineHint {
     fn from(e: EngineArg) -> Self {
         match e {
@@ -366,26 +671,38 @@ impl WorkerArgs {
     /// The resolved [`WorkerSpec`]s (URLs + endpoint + concurrency + engine hint), used
     /// by `serve-batch`'s [`HttpFleet`] which rebuilds a fresh `HttpWorker` fleet per
     /// batch. Mirrors [`build_workers`](Self::build_workers) minus the client construction.
-    fn worker_specs(&self, concurrency: usize) -> Vec<WorkerSpec> {
+    fn worker_specs(&self, concurrency: usize) -> anyhow::Result<Vec<WorkerSpec>> {
+        // NOT infallible: the comment here used to claim `build_workers` surfaces the
+        // error before this runs, but `serve-batch` calls this directly and never
+        // reaches `build_workers`. With `.ok()` a failing entry was silently dropped —
+        // `--workers 'http://a,,http://b'` served a two-worker fleet from a
+        // three-entry flag with no message. The emptiness check upstream counts the raw
+        // strings, not the resolved specs, so an all-bad flag would have served with no
+        // fleet at all.
         self.workers
             .iter()
             .enumerate()
-            .map(|(i, url)| {
-                WorkerSpec::new(format!("w{i}"), url.clone(), self.endpoint.into())
-                    .concurrency(concurrency)
-                    .engine_hint(self.engine.into())
-            })
+            .map(|(i, entry)| self.spec_for(i, entry, concurrency))
             .collect()
+    }
+
+    /// Resolve one `--workers` entry into a [`WorkerSpec`].
+    fn spec_for(&self, i: usize, entry: &str, concurrency: usize) -> anyhow::Result<WorkerSpec> {
+        let parsed = parse_worker_entry(i, entry)?;
+        Ok(WorkerSpec::new(parsed.id, parsed.url, self.endpoint.into())
+            .concurrency(concurrency)
+            // A per-entry hint wins; otherwise the fleet-wide `--engine` applies,
+            // so a single-engine fleet is written exactly as before.
+            .engine_hint(parsed.engine.map_or_else(|| self.engine.into(), Into::into)))
     }
 
     fn build_workers(&self, concurrency: usize) -> anyhow::Result<Vec<HttpWorker>> {
         self.workers
             .iter()
             .enumerate()
-            .map(|(i, url)| {
-                let spec = WorkerSpec::new(format!("w{i}"), url.clone(), self.endpoint.into())
-                    .concurrency(concurrency)
-                    .engine_hint(self.engine.into());
+            .map(|(i, entry)| {
+                let spec = self.spec_for(i, entry, concurrency)?;
+                let url = spec.base_url.clone();
                 HttpWorker::new(spec)
                     .map(|w| {
                         w.with_retry(self.retry_policy())
@@ -409,41 +726,128 @@ impl WorkerArgs {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    // Flag beats env beats default. An unparseable env var is a warning, not a fatal:
+    // refusing to start a six-hour batch over a log-rendering preference would be a
+    // worse outcome than printing text.
+    let format = cli
+        .log_format
+        .unwrap_or_else(|| match std::env::var("FORGE_LOG_FORMAT") {
+            Ok(v) => v.parse().unwrap_or_else(|e| {
+                eprintln!("WARN {e}; falling back to text logs");
+                forge_core::LogFormat::Text
+            }),
+            Err(_) => forge_core::LogFormat::Text,
+        });
+    forge_core::init_logging(format, cli.cmd.name());
 
-    match Cli::parse().cmd {
+    let result = match cli.cmd {
         Cmd::Run(a) => cmd_run(a).await,
         Cmd::Resume(a) => cmd_resume(a).await,
-        Cmd::Status(a) => cmd_status(a).await,
-        Cmd::Audit(a) => cmd_audit(a).await,
-        Cmd::Sweep(a) => cmd_sweep(a).await,
-        Cmd::Import(a) => cmd_import(a).await,
-        Cmd::Cost(a) => cmd_cost(a).await,
+        Cmd::Status(a) => cmd_status(a).await.map(|()| Exit::Complete),
+        Cmd::Audit(a) => cmd_audit(a).await.map(|()| Exit::Complete),
+        Cmd::Sweep(a) => cmd_sweep(a).await.map(|()| Exit::Complete),
+        Cmd::Requeue(a) => cmd_requeue(a).await.map(|()| Exit::Complete),
+        Cmd::Import(a) => cmd_import(a).await.map(|()| Exit::Complete),
+        Cmd::Subset(a) => cmd_subset(a).await.map(|()| Exit::Complete),
+        Cmd::Cost(a) => cmd_cost(a).await.map(|()| Exit::Complete),
         Cmd::Verify(a) => cmd_verify(a).await,
-        Cmd::ServeBatch(a) => cmd_serve_batch(a).await,
+        Cmd::ServeBatch(a) => cmd_serve_batch(a).await.map(|()| Exit::Complete),
         #[cfg(feature = "parquet")]
-        Cmd::Export(a) => cmd_export(a).await,
+        Cmd::Export(a) => cmd_export(a).await.map(|()| Exit::Complete),
+    };
+
+    match result {
+        Ok(code) => code.into(),
+        Err(e) => {
+            // Match anyhow's own top-level rendering (`{:?}` prints the cause chain),
+            // which is what operators are used to reading in logs.
+            eprintln!("Error: {e:?}");
+            exit_for_error(&e).into()
+        }
     }
 }
 
 /// Serve the OpenAI Batch REST front door over the configured worker fleet. Blocks until
 /// Ctrl-C, then stops the accept threads. In-flight batch runs are not force-joined —
 /// their results are already durable in each batch's `ckpt.db` + `out.jsonl`.
+/// Wait for a shutdown signal — **SIGTERM as well as Ctrl-C**.
+///
+/// SIGTERM is the one that matters and the one that was missing. Kubernetes sends it
+/// on eviction, rollout and scale-down; `docker stop` sends it; systemd sends it; a
+/// spot-instance reclaim sends it after the ACPI soft-off. SIGINT (Ctrl-C) only ever
+/// arrives from a human at a terminal — which is the case that was already handled and
+/// the one that matters least, because a human can see what happened.
+///
+/// Waiting on Ctrl-C alone means the graceful path never runs anywhere it counts: the
+/// process sits until the grace period expires and is then SIGKILLed mid-write.
+///
+/// Non-unix targets get Ctrl-C only, which is all those platforms have here.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                // Losing SIGTERM handling is worth saying out loud: it silently turns
+                // every orchestrated stop back into a hard kill.
+                tracing::warn!(error = %e, "could not install a SIGTERM handler; only Ctrl-C will drain");
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT";
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            r = tokio::signal::ctrl_c() => {
+                if let Err(e) = r {
+                    tracing::warn!(error = %e, "ctrl-c listener failed");
+                }
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl-c listener failed");
+        }
+        "SIGINT"
+    }
+}
+
+/// Flip `flag` on the first shutdown signal, in a background task.
+///
+/// Returns the join handle so the caller can abort it — a run that finishes normally
+/// must not leave a signal listener alive holding the process open.
+///
+/// **One signal means drain, and a second does NOT mean die.** A drain finishes only
+/// the items already in flight; an impatient operator's second Ctrl-C would otherwise
+/// throw away exactly the work the first one was protecting. The escape hatch is the
+/// one the OS already provides and that no program can intercept: SIGKILL. That is
+/// safe here precisely because the queue is crash-safe — leases expire and the reaper
+/// reclaims them — so a hard kill costs GPU minutes, never correctness.
+fn spawn_drain_on_signal(flag: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let sig = shutdown_signal().await;
+        eprintln!(
+            "{sig} received — draining: no new work will be leased, in-flight items \
+             will finish. Send SIGKILL to abort immediately (leases expire and are \
+             reclaimed, so nothing is lost but the GPU time)."
+        );
+        flag.store(true, Ordering::SeqCst);
+    })
+}
+
 async fn cmd_serve_batch(a: ServeBatchArgs) -> anyhow::Result<()> {
     if a.workers.workers.is_empty() {
         anyhow::bail!("serve-batch needs at least one --workers endpoint for the fleet");
     }
-    let fleet = HttpFleet::new(
-        a.workers
-            .worker_specs(a.workers.concurrency.unwrap_or(DEFAULT_CONCURRENCY)),
-        a.workers.retry_policy(),
-        a.workers.require.into(),
-    );
+    let specs = a
+        .workers
+        .worker_specs(a.workers.concurrency.unwrap_or(DEFAULT_CONCURRENCY))?;
+    let fleet = HttpFleet::new(specs, a.workers.retry_policy(), a.workers.require.into());
     let cfg = BatchConfig {
         bind: a.listen.clone(),
         data_dir: a.data_dir,
@@ -457,10 +861,11 @@ async fn cmd_serve_batch(a: ServeBatchArgs) -> anyhow::Result<()> {
         "forge serve-batch listening on http://{} — point your OpenAI SDK's base_url here",
         server.addr()
     );
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = %e, "could not listen for Ctrl-C; shutting down");
-    }
-    println!("shutting down");
+    let sig = shutdown_signal().await;
+    println!("{sig} received — shutting down: cancelling and joining running batches");
+    // `shutdown` joins every per-batch supervisor, so results already written stay and
+    // each batch's `ckpt.db` is left resumable. Without SIGTERM here this never ran
+    // under any orchestrator — the process was simply SIGKILLed after the grace period.
     server.shutdown();
     Ok(())
 }
@@ -491,10 +896,37 @@ fn sibling(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-async fn cmd_run(a: RunArgs) -> anyhow::Result<()> {
+async fn cmd_run(a: RunArgs) -> anyhow::Result<Exit> {
     let out = a.out.to_string_lossy().into_owned();
     let object_out = is_object_url(&out);
     ensure_object_store_build(&out, object_out)?;
+    // Parse hook targets BEFORE any work: a typo in --on-complete should fail in the
+    // first millisecond as a usage error, not after a six-hour run.
+    let complete_hook = a.hooks.complete_hook()?;
+    let stall_hook = a.hooks.stall_hook()?;
+    // Fail fast on an object-store input the same way `--out` does: before ingest,
+    // before anything is written, and with an actionable message.
+    let input_raw = a.input.to_string_lossy().into_owned();
+    let object_in = is_object_url(&input_raw);
+    if object_in && !cfg!(feature = "object_store") {
+        return Err(ForgeError::Config(format!(
+            "object-store input ({input_raw}) needs a `forge` built with `--features \
+             object_store`; the default binary reads local files only"
+        ))
+        .into());
+    }
+    // `--prefix-bucket` writes a reordered temp file and re-reads it by path, so it has
+    // no meaning for a stream. Refusing is better than silently ignoring the flag and
+    // leaving the operator to wonder why their cache-hit rate did not move.
+    if object_in && a.prefix_bucket {
+        return Err(ForgeError::Config(
+            "--prefix-bucket cannot be combined with an object-store --input: it is a \
+             local reordering pass over a seekable file. Stage the input locally to use \
+             it, or drop the flag."
+                .to_string(),
+        )
+        .into());
+    }
 
     let queue = SqliteQueue::open(&a.checkpoint)?;
     let concurrency = a.workers.concurrency.unwrap_or(DEFAULT_CONCURRENCY);
@@ -530,7 +962,7 @@ async fn cmd_run(a: RunArgs) -> anyhow::Result<()> {
     } else {
         &a.input
     };
-    let stats = forge_shard::ingest_jsonl_with_rejects(&queue, ingest_input, Some(&reject_path))
+    let stats = ingest_any(&queue, ingest_input, &reject_path)
         .await
         .context("ingesting input JSONL")?;
     tracing::info!(
@@ -549,15 +981,33 @@ async fn cmd_run(a: RunArgs) -> anyhow::Result<()> {
 
     let workers = a.workers.build_workers(concurrency)?;
     let cfg = a.workers.run_config();
+    let watchdog = stall_hook.map(|h| spawn_stall_watchdog(&a.checkpoint, h, a.hooks.stall_secs));
+    // The graceful-drain flag: one signal listener, shared by both output paths.
+    let drain = Arc::new(AtomicBool::new(false));
+    let signals = spawn_drain_on_signal(Arc::clone(&drain));
     let totals = if object_out {
-        run_into_object_store(&out, &object_job_id(&a.checkpoint), queue, workers, cfg).await?
+        run_into_object_store(
+            &out,
+            &object_job_id(&a.checkpoint),
+            queue,
+            workers,
+            cfg,
+            Arc::clone(&drain),
+        )
+        .await?
     } else {
         BatchRun::new(queue, workers, JsonlStore::new(&a.out))
             .with_config(cfg)
+            .with_shutdown(Arc::clone(&drain))
             .run()
             .await
             .context("running batch")?
     };
+    // A finished run must not be held open by a listener waiting for a signal.
+    signals.abort();
+    if let Some(w) = watchdog {
+        w.abort();
+    }
 
     println!(
         "done={} dead={} tokens_this_run={} (total items {})",
@@ -566,7 +1016,130 @@ async fn cmd_run(a: RunArgs) -> anyhow::Result<()> {
         totals.tokens_total(),
         totals.items_total
     );
-    Ok(())
+    let exit = Exit::from_totals(&totals);
+    if let Some(h) = complete_hook {
+        h.fire(&terminal_payload(&totals, exit, &a.checkpoint))
+            .await;
+    }
+    Ok(exit)
+}
+
+/// Hydrate the queue from `input`, which may be a local path OR an object-store URL
+/// (`s3://` / `gs://` / `az://`). Both paths run the SAME line-oriented ingest — the
+/// object-store case only supplies a different reader — so batching, the reject
+/// sidecar, and the `Shard` bookkeeping that makes a re-run seek instead of rescan are
+/// identical either way.
+async fn ingest_any<Q: Queue>(
+    queue: &Q,
+    input: &Path,
+    reject_path: &Path,
+) -> anyhow::Result<forge_shard::IngestStats> {
+    let raw = input.to_string_lossy().into_owned();
+    if !is_object_url(&raw) {
+        return Ok(forge_shard::ingest_jsonl_with_rejects(queue, input, Some(reject_path)).await?);
+    }
+    #[cfg(not(feature = "object_store"))]
+    {
+        let _ = reject_path;
+        Err(ForgeError::Config(format!(
+            "object-store input ({raw}) needs a `forge` built with `--features object_store`;              the default lean binary reads local files only. Rebuild with              `cargo build -p forge-cli --release --features object_store`."
+        ))
+        .into())
+    }
+    #[cfg(feature = "object_store")]
+    {
+        // The caller owns positioning for the reader-based ingest, so ask the queue
+        // where it got to and let the store tell us where it could actually start
+        // (a truncated/replaced object rewinds to 0 rather than reading an empty range).
+        let (offset, line) = queue.hydrated_through().await?.unwrap_or((0, 0));
+        let (reader, start) = forge_store::open_input_stream(&raw, offset).await?;
+        let start_line = if start == offset { line } else { 0 };
+        Ok(forge_shard::ingest_reader_with_rejects(
+            queue,
+            reader,
+            start,
+            start_line,
+            Some(reject_path),
+        )
+        .await?)
+    }
+}
+
+/// Spawn a background watchdog that fires `hook` once if the run stops making
+/// progress. It polls a SECOND read-only handle on the same checkpoint — safe because
+/// the queue runs in WAL mode with a 60s busy timeout (`forge-queue/src/sqlite.rs`),
+/// which is the same way `forge status` reads a checkpoint under an active run.
+///
+/// "Progress" is a newly-terminal item (done + dead). A run that is merely slow does
+/// not stall; a run whose fleet has died does, because nothing reaches terminal.
+/// Fires at most once — a dead fleet must not become a notification loop.
+fn spawn_stall_watchdog(
+    checkpoint: &Path,
+    hook: hooks::Hook,
+    stall_secs: u64,
+) -> tokio::task::JoinHandle<()> {
+    let path = checkpoint.to_path_buf();
+    // Poll often enough to be responsive, rarely enough to stay invisible next to the
+    // run's own queue traffic, and never longer than the stall budget itself.
+    let poll = Duration::from_secs(stall_secs.clamp(1, 30));
+    tokio::spawn(async move {
+        let queue = match SqliteQueue::open(&path) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(error = %e, "stall watchdog could not open the checkpoint; disabled");
+                return;
+            }
+        };
+        let mut last_terminal = u64::MAX;
+        let mut since = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(poll).await;
+            let Ok(c) = queue.counts().await else {
+                continue;
+            };
+            let terminal = c.done + c.dead;
+            if last_terminal == u64::MAX || terminal > last_terminal {
+                last_terminal = terminal;
+                since = tokio::time::Instant::now();
+                continue;
+            }
+            if since.elapsed() >= Duration::from_secs(stall_secs) {
+                let payload = serde_json::json!({
+                    "event": "stall",
+                    "checkpoint": path.to_string_lossy(),
+                    "stalled_secs": since.elapsed().as_secs(),
+                    "pending": c.pending,
+                    "leased": c.leased,
+                    "done": c.done,
+                    "dead": c.dead,
+                    "total": c.total(),
+                    "hint": "no item reached a terminal state in this window — the fleet may be gone; `forge audit` shows what a resume would reclaim",
+                });
+                hook.fire(&payload).await;
+                return; // once only
+            }
+        }
+    })
+}
+
+/// The JSON handed to `--on-complete`, and the same shape a pipeline gets from
+/// `status --json` plus the run's outcome.
+fn terminal_payload(totals: &JobTotals, exit: Exit, checkpoint: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "event": "complete",
+        "checkpoint": checkpoint.to_string_lossy(),
+        "exit_code": exit as u8,
+        "outcome": match exit {
+            Exit::Complete => "complete",
+            Exit::DeadLetters => "complete_with_dead_letters",
+            Exit::Incomplete => "incomplete",
+            _ => "unknown",
+        },
+        "items_total": totals.items_total,
+        "items_done": totals.items_done,
+        "items_dead": totals.items_dead,
+        "tokens_total": totals.tokens_total(),
+    })
 }
 
 /// Does `--out` name an object store (a `scheme://` prefix) rather than a local path?
@@ -638,11 +1211,13 @@ async fn run_into_object_store(
     queue: SqliteQueue,
     workers: Vec<HttpWorker>,
     cfg: RunConfig,
+    drain: Arc<AtomicBool>,
 ) -> anyhow::Result<JobTotals> {
     let store =
         forge_store::objstore_from_out(out, job).context("opening the object-store output")?;
     BatchRun::new(queue, workers, store)
         .with_config(cfg)
+        .with_shutdown(drain)
         .run()
         .await
         .context("running batch to object storage")
@@ -655,6 +1230,7 @@ async fn run_into_object_store(
     _queue: SqliteQueue,
     _workers: Vec<HttpWorker>,
     _cfg: RunConfig,
+    _drain: Arc<AtomicBool>,
 ) -> anyhow::Result<JobTotals> {
     anyhow::bail!("object-store output ({out}) needs `--features object_store`")
 }
@@ -777,7 +1353,11 @@ fn resolve_resume_out(queue: &SqliteQueue, supplied: Option<&Path>) -> anyhow::R
     }
 }
 
-async fn cmd_resume(a: ResumeArgs) -> anyhow::Result<()> {
+async fn cmd_resume(a: ResumeArgs) -> anyhow::Result<Exit> {
+    // Parsed first: a bad hook target is a usage error, not a post-run surprise.
+    let complete_hook = a.hooks.complete_hook()?;
+    let stall_hook = a.hooks.stall_hook()?;
+    let watchdog = stall_hook.map(|h| spawn_stall_watchdog(&a.checkpoint, h, a.hooks.stall_secs));
     let queue = SqliteQueue::open(&a.checkpoint)?;
     let out = resolve_resume_out(&queue, a.out.as_deref())?;
     let out_str = out.to_string_lossy().into_owned();
@@ -787,15 +1367,32 @@ async fn cmd_resume(a: ResumeArgs) -> anyhow::Result<()> {
     let concurrency = resolve_resume_concurrency(&queue, a.workers.concurrency)?;
     let workers = a.workers.build_workers(concurrency)?;
     let cfg = a.workers.run_config();
+    // The graceful-drain flag: one signal listener, shared by both output paths.
+    let drain = Arc::new(AtomicBool::new(false));
+    let signals = spawn_drain_on_signal(Arc::clone(&drain));
     let totals = if object_out {
-        run_into_object_store(&out_str, &object_job_id(&a.checkpoint), queue, workers, cfg).await?
+        run_into_object_store(
+            &out_str,
+            &object_job_id(&a.checkpoint),
+            queue,
+            workers,
+            cfg,
+            Arc::clone(&drain),
+        )
+        .await?
     } else {
         BatchRun::new(queue, workers, JsonlStore::new(&out))
             .with_config(cfg)
+            .with_shutdown(Arc::clone(&drain))
             .run()
             .await
             .context("resuming batch")?
     };
+    // A finished run must not be held open by a listener waiting for a signal.
+    signals.abort();
+    if let Some(w) = watchdog {
+        w.abort();
+    }
 
     println!(
         "done={} dead={} tokens_this_run={} (total items {})",
@@ -804,7 +1401,12 @@ async fn cmd_resume(a: ResumeArgs) -> anyhow::Result<()> {
         totals.tokens_total(),
         totals.items_total
     );
-    Ok(())
+    let exit = Exit::from_totals(&totals);
+    if let Some(h) = complete_hook {
+        h.fire(&terminal_payload(&totals, exit, &a.checkpoint))
+            .await;
+    }
+    Ok(exit)
 }
 
 /// Machine-readable run report (`forge status --json`). Surfaces the
@@ -1011,6 +1613,191 @@ async fn cmd_sweep(a: SweepArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Put dead-lettered items back on the queue, and prune the store records that would
+/// otherwise throw their re-run results away.
+///
+/// **Order is the correctness argument, not a detail.** The store is pruned FIRST and
+/// the queue flipped SECOND. Reversed, a crash between the two leaves items runnable
+/// whose dead records still stand — they re-run against a real GPU and `put`
+/// short-circuits their results into the void, silently. In this order the crash window
+/// leaves items still marked dead whose records are already gone, which `forge verify`
+/// reports as missing and which re-running this same command heals (both halves are
+/// idempotent, and the requeue is driven by the QUEUE, not by the file that was pruned).
+async fn cmd_requeue(a: RequeueArgs) -> anyhow::Result<()> {
+    let out = a.out.to_string_lossy().into_owned();
+    if is_object_url(&out) {
+        anyhow::bail!(
+            "--out {out} is an object-store URL. Requeue prunes the dead-letter sidecar \
+             in place, which this command only does for a local file. Copy the run's \
+             dead-letter object down, requeue against a local --out, and re-upload — or \
+             rebuild a runnable input with `forge subset` and run it as a new job."
+        );
+    }
+    if a.ids.is_none() && !a.all && a.reason.is_none() {
+        anyhow::bail!(
+            "nothing selected: pass --ids <file>, --reason <substring>, or --all. \
+             Requeue reverses a terminal state, so it never guesses at the scope."
+        );
+    }
+
+    let queue = SqliteQueue::open(&a.checkpoint).context("opening checkpoint")?;
+
+    // A live coordinator is a hard refusal, not a warning. It holds the store's
+    // emitted-id set in MEMORY, seeded when it started; pruning the file underneath it
+    // changes nothing it can see, so every requeued item would still have its result
+    // discarded — the exact failure this command exists to prevent, made invisible by
+    // appearing to succeed.
+    let (_counts, audit) = queue
+        .audit_snapshot(forge_core::now_ms())
+        .await
+        .context("reading checkpoint state")?;
+    if audit.live_leases > 0 {
+        let holders: Vec<String> = audit
+            .live_holders
+            .iter()
+            .map(|(w, n)| format!("{w} ({n})"))
+            .collect();
+        anyhow::bail!(
+            "refusing to requeue while a coordinator is running on this checkpoint: \
+             {} live lease(s) held by {}. That process cached the emitted-id set at \
+             startup, so pruning the dead-letter file now would not reach it and every \
+             requeued item's result would still be discarded. Stop the run, then requeue.",
+            audit.live_leases,
+            if holders.is_empty() {
+                "an unnamed worker".to_string()
+            } else {
+                holders.join(", ")
+            }
+        );
+    }
+
+    let dead = queue.dead_letters().await.context("listing dead-letters")?;
+    let selected: Vec<String> = if a.all {
+        dead.iter().map(|(id, _)| id.clone()).collect()
+    } else if let Some(reason) = &a.reason {
+        dead.iter()
+            .filter(|(_, e)| e.as_deref().is_some_and(|e| e.contains(reason.as_str())))
+            .map(|(id, _)| id.clone())
+            .collect()
+    } else {
+        let wanted = forge_shard::load_ids(a.ids.as_ref().unwrap())
+            .await
+            .context("reading --ids")?;
+        dead.iter()
+            .filter(|(id, _)| wanted.contains(id))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+
+    if selected.is_empty() {
+        // Not an error: "nothing matched" is a legitimate and common answer, and
+        // exiting non-zero here would break a cron that requeues timeouts nightly.
+        if a.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dead_total": dead.len(), "selected": 0, "requeued": 0,
+                    "pruned": 0, "dry_run": a.dry_run,
+                })
+            );
+        } else {
+            println!(
+                "nothing to requeue: {} dead-lettered item(s) in {}, none matched the \
+                 selection",
+                dead.len(),
+                a.checkpoint.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let dead_path = forge_store::JsonlStore::new(&a.out)
+        .dead_path()
+        .to_path_buf();
+    if a.dry_run {
+        if a.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dead_total": dead.len(), "selected": selected.len(),
+                    "requeued": 0, "pruned": 0, "dry_run": true,
+                    "ids": selected, "dead_file": dead_path.to_string_lossy(),
+                })
+            );
+        } else {
+            println!(
+                "would requeue {} of {} dead-lettered item(s), pruning their records \
+                 from {}",
+                selected.len(),
+                dead.len(),
+                dead_path.display()
+            );
+            for id in selected.iter().take(20) {
+                println!("  {id}");
+            }
+            if selected.len() > 20 {
+                println!("  … and {} more", selected.len() - 20);
+            }
+        }
+        return Ok(());
+    }
+
+    // Store first. See the ordering note above.
+    let want: std::collections::HashSet<String> = selected.iter().cloned().collect();
+    let prune = forge_store::prune_dead_letters(&dead_path, &want)
+        .await
+        .context("pruning the dead-letter file")?;
+    let requeued = queue
+        .requeue_dead(&selected)
+        .await
+        .context("re-queueing dead-lettered items")?;
+
+    if a.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dead_total": dead.len(),
+                "selected": selected.len(),
+                "requeued": requeued.len(),
+                "pruned": prune.removed,
+                "dead_records_kept": prune.kept,
+                "dead_records_unreadable": prune.lines_unreadable,
+                "not_in_dead_file": prune.not_found,
+                "dry_run": false,
+            })
+        );
+    } else {
+        println!(
+            "requeued {} item(s); pruned {} dead-letter record(s) from {}",
+            requeued.len(),
+            prune.removed,
+            dead_path.display()
+        );
+        if !prune.not_found.is_empty() {
+            // Stated, not swallowed: the queue and the store can legitimately disagree
+            // (a previous prune ran, or the item died before the store saw it), but an
+            // operator deciding whether the retry is safe needs the number.
+            println!(
+                "  note: {} selected id(s) had no record in the dead-letter file \
+                 (already pruned, or never written there)",
+                prune.not_found.len()
+            );
+        }
+        if prune.lines_unreadable > 0 {
+            println!(
+                "  note: {} unreadable line(s) in the dead-letter file were left \
+                 untouched",
+                prune.lines_unreadable
+            );
+        }
+        println!(
+            "  re-run with `forge resume --checkpoint {} …` to run them",
+            a.checkpoint.display()
+        );
+    }
+    Ok(())
+}
+
 /// A subset-of-total percentage, `0.0` when the denominator is zero.
 fn pct(part: u64, whole: u64) -> f64 {
     if whole == 0 {
@@ -1088,6 +1875,38 @@ async fn cmd_cost(a: CostArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cmd_subset(a: SubsetArgs) -> anyhow::Result<()> {
+    let stats = forge_shard::subset_jsonl(&a.input, &a.ids, &a.out, a.invert)
+        .await
+        .context("subsetting input JSONL")?;
+    println!(
+        "subset {} -> {} (ids={} read={} written={} unmatched={} unparsable={})",
+        a.input.display(),
+        a.out.display(),
+        stats.ids_loaded,
+        stats.lines_read,
+        stats.written,
+        stats.ids_unmatched,
+        stats.unparsable,
+    );
+    // An id that never appeared in the input almost always means the list and the
+    // input are from different jobs — silently emitting a short file would send the
+    // operator off to run a batch that is missing exactly the work they wanted.
+    if stats.ids_unmatched > 0 {
+        tracing::warn!(
+            unmatched = stats.ids_unmatched,
+            "some ids were not found in the input — is this the same job's input file?"
+        );
+    }
+    if stats.unparsable > 0 {
+        tracing::warn!(
+            unparsable = stats.unparsable,
+            "some input lines had no usable custom_id and were skipped"
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_import(a: ImportArgs) -> anyhow::Result<()> {
     // Unusable / duplicate lines are preserved beside the output for repair.
     let reject = sibling(&a.out, ".reject.jsonl");
@@ -1113,7 +1932,7 @@ async fn cmd_import(a: ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_verify(a: VerifyArgs) -> anyhow::Result<()> {
+async fn cmd_verify(a: VerifyArgs) -> anyhow::Result<Exit> {
     let results = a.results.to_string_lossy().into_owned();
     let object_results = is_object_url(&results);
     ensure_object_store_build(&results, object_results)?;
@@ -1181,10 +2000,13 @@ async fn cmd_verify(a: VerifyArgs) -> anyhow::Result<()> {
     }
 
     // Non-zero exit exactly when something is missing — the CI/acceptance gate.
+    // `Incomplete` (2) rather than a bail (1): incompleteness is a VALID answer that
+    // the report above already stated plainly, and the distinction tells a pipeline
+    // that resuming is the correct response. Still non-zero, so `set -e` behaves.
     if !report.is_complete() {
-        anyhow::bail!("{} input id(s) have no terminal result", report.missing);
+        return Ok(Exit::Incomplete);
     }
-    Ok(())
+    Ok(Exit::Complete)
 }
 
 #[cfg(test)]

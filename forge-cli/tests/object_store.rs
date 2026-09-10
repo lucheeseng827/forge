@@ -130,3 +130,100 @@ async fn run_and_resume_to_object_store() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Hydrating from an object-store URL must be indistinguishable from a local file —
+/// same ingest, same dedup, same `Shard` bookkeeping — because it IS the same code
+/// path with a different reader. If these ever diverge, the object-store input is
+/// quietly a second implementation.
+#[cfg(feature = "object_store")]
+mod object_input {
+    use forge_core::Queue;
+    use forge_queue::SqliteQueue;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("forge-objinput-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn input_body(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"custom_id":"req-{i}","method":"POST","url":"/v1/chat/completions","body":{{"model":"m"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    async fn ingest_from_url(queue: &SqliteQueue, url: &str, reject: &std::path::Path) -> u64 {
+        let (offset, line) = queue.hydrated_through().await.unwrap().unwrap_or((0, 0));
+        let (reader, start) = forge_store::open_input_stream(url, offset).await.unwrap();
+        let start_line = if start == offset { line } else { 0 };
+        forge_shard::ingest_reader_with_rejects(queue, reader, start, start_line, Some(reject))
+            .await
+            .unwrap()
+            .hydrated
+    }
+
+    #[tokio::test]
+    async fn hydrates_from_a_url_and_a_second_pass_seeks_instead_of_rescanning() {
+        let d = dir("seek");
+        let file = d.join("in.jsonl");
+        std::fs::write(&file, input_body(50)).unwrap();
+        let url = format!("file://{}", file.display());
+        let reject = d.join("rej.jsonl");
+
+        let queue = SqliteQueue::open(d.join("ck.db")).unwrap();
+        assert_eq!(ingest_from_url(&queue, &url, &reject).await, 50);
+        assert_eq!(queue.counts().await.unwrap().total(), 50);
+
+        // The offset bookkeeping must have advanced, or a re-run would rescan 50M lines.
+        let (offset, _) = queue
+            .hydrated_through()
+            .await
+            .unwrap()
+            .expect("a recorded shard");
+        assert!(offset > 0, "ingest must record how far it got");
+
+        // Second pass over the unchanged object: nothing new, and — the point — it
+        // resumes from the recorded offset rather than re-reading the whole object.
+        assert_eq!(ingest_from_url(&queue, &url, &reject).await, 0);
+        assert_eq!(queue.counts().await.unwrap().total(), 50);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_shorter_object_rescans_rather_than_ingesting_nothing() {
+        let d = dir("replaced");
+        let file = d.join("in.jsonl");
+        std::fs::write(&file, input_body(40)).unwrap();
+        let url = format!("file://{}", file.display());
+        let reject = d.join("rej.jsonl");
+
+        let queue = SqliteQueue::open(d.join("ck.db")).unwrap();
+        assert_eq!(ingest_from_url(&queue, &url, &reject).await, 40);
+
+        // The input is swapped for a SHORTER one carrying different ids. The recorded
+        // offset now points past its end; serving an empty range there would silently
+        // ingest nothing and look like a clean no-op run.
+        std::fs::write(
+            &file,
+            r#"{"custom_id":"fresh-1","method":"POST","url":"/v1/chat/completions","body":{"model":"m"}}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ingest_from_url(&queue, &url, &reject).await,
+            1,
+            "a truncated/replaced object must rescan from the start, not read nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
