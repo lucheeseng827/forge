@@ -38,7 +38,7 @@ pub use obs::{
     accept_request_id, current_request_id, internal_error_body, mint_request_id, scope_request_id,
 };
 pub use retry::RetryPolicy;
-pub use run::{BatchRun, RunConfig};
+pub use run::{runtime, BatchRun, RunConfig, MAX_BLOCKING_THREADS};
 pub use state::ItemState;
 pub use traits::{Queue, QueueCounts, ResultStore, Worker};
 pub use types::{

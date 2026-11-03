@@ -175,3 +175,201 @@ Cost of the entire measured run, on-demand: ≈ $0.42 (4 nodes × ~35 minutes).
 
 Reproduce: launch any 3 boxes that can reach each other on :8000, run the sim
 with `ENGINE_SIM_HOST=0.0.0.0`, point `forge run --workers` at their addresses.
+
+## Coordinator memory: the blocking pool, not the queue
+
+**The claim:** forge's resident memory is set by its *thread* count, not by N — and
+capping the blocking pool at 16 cuts peak RSS 7.6× at no cost in throughput.
+
+Found by running the scale bench on a 32-core box, where the test process reached
+**5.4 GiB** and climbed. The queue was not the cause, and neither was SQLite:
+
+```
+VmRSS 5,388,412 kB   Pss_File 2,268 kB   [heap] 23 MB   state.db-wal 5 MB
+Anonymous 5,114,588 kB   Threads 518
+/proc/<pid>/smaps: 235 × (23 MB, rw-p) + 234 × (40 MB, ---p)
+```
+
+Those VMA pairs are glibc **non-main malloc arenas** — a 64 MiB `PROT_NONE`
+reservation each, whose first ~23 MiB has been `mprotect`ed writable and dirtied.
+235 × 23 MiB is the whole RSS.
+
+Why 518 threads existed: SQLite is synchronous, so every `SqliteQueue` operation is a
+`spawn_blocking` that then takes the queue's single `Mutex<Connection>`. The dispatch
+window holds the fleet's summed concurrency in flight (64 workers × cap 16 = 1024
+here), so ~1024 blocking closures queue at once, all block on that one mutex, and
+tokio answers "every blocking thread is busy" by spawning another — to its default
+ceiling of 512. glibc then gives each new thread its own arena (capped at 8 × ncores),
+and freed chunks return to the arena's free lists rather than to the kernel, so the
+high-water mark only ratchets.
+
+**It therefore scales with core count, not with N**, which is why a 4–8 core CI runner
+never saw it (~1.5 GiB) while a 32-core box reached 5.4 GiB. The runaway guard in
+`scale.rs` (`300 + N/1000 × 1.5` = 1800 MiB at N=1M) only fires on a big machine.
+
+Run 2026-09-10, N=50,000, 64 workers, release, all six cases in parallel:
+
+| `max_blocking_threads` | `MALLOC_ARENA_MAX` | peak RSS | threads | items/s |
+|---|---|---|---|---|
+| 512 (tokio default) | default | 349 MiB | 518 | 258 |
+| 512 | 2 | 38 MiB | 518 | 251 |
+| **16 (now shipped)** | default | **46 MiB** | 22 | **269** |
+| 8 | default | 36 MiB | 14 | 261 |
+| 8 | 2 | 26 MiB | 14 | 264 |
+| 2 | default | 28 MiB | 8 | 264 |
+
+Read it: throughput is flat across a **256× range** of pool sizes, because the
+connection mutex serialises those threads regardless — the useful blocking concurrency
+is ~1. So the 512 threads bought nothing and cost 300 MiB. 16 is the shipped ceiling
+rather than the aggressive end: marginally the fastest of the set, and it leaves ~8×
+headroom over the measured need for the other blocking users (`tokio::fs` writes in
+the result store) so nothing queues behind queue ops. `forge_core::runtime()` is the
+one place that sets it; `MALLOC_ARENA_MAX` is deliberately left alone, because the
+shipped image is musl-static and musl has no per-thread arenas.
+
+At the bench's default N=1M the same run peaks at **30 MiB** where it previously
+reached 5,388 MiB. Most of that is this ceiling; the last 370 MiB came out with the
+lease fix below, whose sorter was holding the rest.
+
+## The lease was O(pending) per item — 7.7 items/s at N=1M, now 2,830
+
+**The claim:** a lease costs the same whether the queue holds a thousand items or a
+million, so the fan-out figures above extrapolate instead of collapsing.
+
+They did not, before. The N=1M soak run to check the memory ceiling above managed
+**91,163 of 1,000,000 items in 3 h 17 m — 7.7 items/s, against 269 at N=50k** — and
+wrote 2.06 GB for those 91k items, 22 KB each, none of it result data.
+
+The cause was in `LEASE_SQL`. Its selection was one predicate,
+`status = 'pending' OR (status = 'leased' AND leased_until < ?)`, with
+`ORDER BY rowid LIMIT ?`. No index can serve both that `OR` and an ordering on
+`rowid`, so SQLite answered `MULTI-INDEX OR` + **`USE TEMP B-TREE FOR ORDER BY`** and
+sorted the *entire* matching set before the `LIMIT` applied. Since `BatchRun` consumes
+exactly one completion per iteration and immediately tops the freed slot back up — the
+sliding window, deliberately — a steady-state run leases once per item. That made it a
+full sort of the pending set **per item**: O(N²) over a run, and the sorter's spills
+were the 22 KB/item of writes.
+
+The fix is to ask for the order the index already has. `idx_items_status` is
+`(status, leased_until)`, so under an equality on `status` its entries come out ordered
+by `leased_until` and then by the index's implicit trailing `rowid`.
+`ORDER BY leased_until, rowid` is therefore answered by a scan with early exit, while
+`ORDER BY rowid` alone is not — SQLite cannot prove `leased_until` is constant, so it
+sorts. Every pending row has `leased_until IS NULL`, so the two orderings select the
+same rows in the same order: insertion order, which `--prefix-bucket` depends on. The
+`OR` is split into two `LIMIT`-ed branches so each stays index-served, and the outer
+`ORDER BY` interleaves at most `2 × limit` rows.
+
+Selection matches the old form on the steady state, and the 1M cross-check confirms
+that much: with expired leases present it returned the same 1024 rows in the same
+order — the same 500 reclaimed and 524 fresh. It does not prove the general case, and
+the general case is not identical. Each branch carries its own `LIMIT`, and the expired
+branch is ordered by `leased_until`, so once MORE than `limit` leases have expired *and*
+they carry distinct `leased_until` values, it offers the oldest leases rather than the
+lowest rowids. The check above could not have seen that: 500 expired rows against a
+limit of 1024 leaves the branch 524 short of its cap, and below the cap it drops
+nothing.
+
+No work is lost when they do diverge — a passed-over row is still expired, still
+eligible, and re-leasing only moves `leased_until` forward, so the expired set strictly
+shrinks. What changes is reclaim order, and the only thing riding on that is the cache
+locality `--prefix-bucket` buys, which a reclaimed row has already left behind. The
+pending branch — the hot path, and the one `--prefix-bucket` is actually about — stays
+exactly insertion-ordered. Cost is the part that changes outright:
+
+| pending rows | old select | new select |
+|---|---|---|
+| 1,000,000 | 211 ms | **0.115 ms** |
+| 500,000 | 103 ms | **0.099 ms** |
+| 100,000 | 21.8 ms | **0.090 ms** |
+
+Flat instead of linear, which is the whole point: the old cost fell as the queue
+drained, so a run's own progress line accelerated and read like warm-up rather than a
+cliff.
+
+End to end, the same N=1M fan-out that was abandoned at 91k items after 3 h 17 m:
+
+| | before | after |
+|---|---|---|
+| wall | 3 h 17 m (stopped at 9% done) | **353.3 s, complete** |
+| throughput | 7.7 items/s | **2,830 items/s** |
+| peak RSS | 402 MiB | **30 MiB** |
+
+It is now faster at N=1M than the old code was at N=50k, and the 400-item and 50k
+figures elsewhere in this document improve for the same reason — they were paying a
+smaller version of the same sort.
+
+Reproduce:
+
+```sh
+FORGE_SCALE_N=50000 cargo test --release -p forge-cli --test scale \
+  -- --ignored --exact fan_out_at_scale_completes --nocapture
+# watch it from another shell:
+grep -E 'VmRSS|Threads' /proc/<pid>/status
+grep -c ' ---p ' /proc/<pid>/maps      # one per arena reservation
+```
+
+## Verification run — 2026-09-10, release, containerised (32-core host)
+
+Everything below was measured in one sitting on the same box, against
+`examples/engine_sim.py`. It re-runs the claims above on today's tree rather than
+adding new ones, so the numbers are a **regression check**: they land ~5% under the
+figures recorded above, consistent with running in a container that shared the host
+with a 1M-item soak.
+
+### Fleet throughput (400 items, `--concurrency 8`)
+
+| Fleet | this run | recorded above | ideal ceiling |
+|---|---|---|---|
+| 1 fast box | 12.28 items/s | 12.99 | ~13.3 (92%) |
+| 2 fast boxes | 24.13 items/s | 25.76 | ~26.7 (90%) |
+| 2 fast + 1 weak (mixed) | 24.11 items/s | 25.59 | ~30 |
+
+Every case: 400/400 done, 0 dead-lettered, `forge verify` exit 0 (`missing=0 extra=0
+duplicate_input=0`). Even split on two fast boxes (197/203). In the mixed fleet the
+weak box took **50** items at its own pace (49 in the recorded run) with peak
+engine-side queue depth 4 and **zero 429s** — the sliding window still keeps it from
+gating the fleet. Coordinator peak RSS 8.3 / 8.9 / 9.1 MB across the three cases.
+
+### Overload safety (declared `--concurrency 64` against a true cap of 8)
+
+200 items, one box: **200/200 done, 0 dead-lettered, 0 permanently lost**, 26
+engine-side 429s, engine peak queue depth 24. AIMD plus the shared `Retry-After`
+cooldown absorbed an 8× overdeclaration without losing an item.
+
+### Spot kill → audit → resume → verify (300 items, `--lease-secs 15`)
+
+| stage | pending | live | orphaned | done | reclaimable | interrupted |
+|---|---|---|---|---|---|---|
+| after `kill -9` (108 done) | 184 | **8** | 0 | 108 | 184 | false |
+| after the lease TTL lapses | 184 | 0 | **8** | 108 | **192** | **true** |
+| after `forge resume` | 0 | 0 | 0 | **300** | 0 | — |
+
+`retried=8` — exactly the reclaimed leases — and the engine served 308 for 300 items,
+so the 8 interrupted items ran twice and were stored once. `forge verify`: 300 emitted
+ids, 0 missing, 0 extra, 0 duplicate results.
+
+### SIGTERM is a *graceful* drain, and measurably different from a kill
+
+Same batch, `SIGTERM` 7s in: exit code 2, in-flight work drained in **601 ms**, 91
+results written, and the audit shows **0 live and 0 orphaned leases** — a clean
+resumable checkpoint rather than 8 leases waiting out a TTL. The follow-up `resume`
+completed 300/300 with `retried=0`: nothing had to be reclaimed, which is the whole
+difference from the `kill -9` row above.
+
+### Dead-letter requeue prunes before it re-queues
+
+40 items quarantined by `--require json` (exit code 4, `failures[validation=40]`).
+`forge requeue --all --dry-run` listed all 40 and changed nothing; the real run
+reported `pruned=40 requeued=40` and the `.dead.jsonl` sidecar dropped to 0 lines. A
+`resume --require any` then landed all 40 **in the results file** (40 lines) —
+`verify` exit 0. Without the prune the store's emitted-id set would have discarded
+every one of those fresh results.
+
+### Suites
+
+`cargo test --locked --workspace`: **226 passed, 0 failed** (`fmt --check` and
+`clippy --all-targets -D warnings` clean). Two `#[ignore]`d scale benchmarks are
+excluded by default, as is the feature-gated work: `--features object_store` adds 3
+tests, `--features parquet` adds 1, and all 4 pass. Checkpoints written by this
+version carry `meta.schema_version=1` and `meta.forge_version=0.2.0`.

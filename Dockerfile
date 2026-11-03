@@ -22,10 +22,17 @@ COPY . .
 # `strip = true` in the release profile, so there is nothing to tolerate the absence
 # of.
 RUN cargo build -p forge-cli --release --locked
+# An empty /data for the runtime image to own (scratch has no mkdir).
+RUN mkdir -p /out/data
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /src/target/release/forge /forge
+# /data belongs to the runtime user. A named volume mounted there (`-v forge-data:/data`,
+# the documented `serve-batch` quick start) starts as a copy of this directory, owner
+# included; with no /data in the image, Docker created it root-owned and uid 65532 could
+# not write its own data dir ("Permission denied (os error 13)").
+COPY --from=build --chown=65532:65532 /out/data /data
 # Non-root (distroless "nonroot" convention); the binary needs no privileges.
 USER 65532:65532
 ENTRYPOINT ["/forge"]

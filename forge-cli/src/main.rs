@@ -725,8 +725,13 @@ impl WorkerArgs {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The blocking pool is capped here rather than left at tokio's 512 — see
+    // `forge_core::runtime`.
+    forge_core::runtime().block_on(run())
+}
+
+async fn run() -> ExitCode {
     let cli = Cli::parse();
     // Flag beats env beats default. An unparseable env var is a warning, not a fatal:
     // refusing to start a six-hour batch over a log-rendering preference would be a

@@ -44,7 +44,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forge_core::{ForgeError, Item, ItemResult, ItemState, TokenUsage, Worker};
-use forge_proto::{InterruptionNotice, LeasePull, ResultPost, WireItem, WireOutcome, WireUsage};
+use forge_proto::{
+    InterruptionNotice, LeaseGrant, LeasePull, ResultPost, WireItem, WireOutcome, WireUsage,
+};
 use forge_spot::{Cloud, InterruptionSource, NoticeKind};
 use futures_util::stream::{self, StreamExt};
 
@@ -77,9 +79,15 @@ impl Drain {
 /// and (follow-up) by an HTTP client.
 pub trait Coordinator {
     /// Lease up to `req.max` ready items. An empty grant means "nothing ready now"
-    /// (the agent backs off and polls again). The coordinator has already marked the
-    /// returned items `Leased` and stamped their generation.
-    async fn pull(&self, req: &LeasePull) -> Result<Vec<WireItem>, ForgeError>;
+    /// (the agent backs off and polls again); an empty grant with
+    /// [`LeaseGrant::drained`] set means there is no further work at all. The
+    /// coordinator has already marked the returned items `Leased` and stamped their
+    /// generation.
+    ///
+    /// Returns the whole [`LeaseGrant`] rather than just its items: `drained` is the
+    /// one thing an agent cannot work out for itself, and flattening it away here is
+    /// what left the agent guessing from consecutive empty polls.
+    async fn pull(&self, req: &LeasePull) -> Result<LeaseGrant, ForgeError>;
 
     /// Post one finished item back, fenced by its lease generation. The coordinator
     /// stores-then-acks; a post is an idempotent proposal, safe to retry.
@@ -103,8 +111,11 @@ pub struct AgentConfig {
     pub lease_secs: u64,
     /// Backoff between polls when a grant is empty or the engine is unhealthy.
     pub poll_idle: Duration,
-    /// Exit after this many *consecutive* empty grants (the run looks drained). `0`
-    /// means never idle-exit — run as a daemon until [`Drain`] or an external stop.
+    /// Exit after this many *consecutive* empty grants. A **fallback** for a
+    /// coordinator too old to report [`LeaseGrant::drained`] — an empty grant alone
+    /// cannot distinguish "the batch is finished" from "another box holds the last
+    /// items", so this is a heuristic where the flag is a fact. `0` means never
+    /// idle-exit on the heuristic; a drained grant still ends the loop.
     pub max_idle_polls: u32,
 }
 
@@ -131,6 +142,10 @@ pub struct AgentStats {
     pub idle_polls: usize,
     /// Did the loop exit because the [`Drain`] latch fired?
     pub drained: bool,
+    /// Did the loop exit because the coordinator reported the queue empty of work —
+    /// nothing pending, nothing leased anywhere? This is the batch-finished exit, as
+    /// opposed to [`AgentStats::drained`], which is the spot-notice exit.
+    pub queue_drained: bool,
 }
 
 /// Map a wire item back to the in-process [`Item`] the [`Worker`] runs. Status is
@@ -254,6 +269,30 @@ pub async fn run_agent(
         if !worker.is_ready() {
             worker.probe().await;
             if !worker.is_ready() {
+                // ...but still ask whether there is anything left to come back for.
+                //
+                // This gate used to `continue` straight past the pull, which is the one
+                // path where the agent never learns the queue is drained. An engine that
+                // does not come back — OOM'd, preempted, container gone — then left the
+                // box polling a corpse until someone noticed the bill, which is the exact
+                // cost this change exists to stop, reached by the door it left open.
+                //
+                // `max: 0` asks the question without answering a different one: the lease
+                // statement's `LIMIT 0` matches no rows, so nothing is leased into an
+                // engine that could not run it. An error is swallowed rather than
+                // propagated — a coordinator blip while the engine restarts should leave
+                // the agent polling exactly as it did before, not kill the run.
+                let probe = coord
+                    .pull(&LeasePull {
+                        worker_id: cfg.worker_id.clone(),
+                        max: 0,
+                        lease_secs: cfg.lease_secs,
+                    })
+                    .await;
+                if matches!(&probe, Ok(g) if g.drained) {
+                    stats.queue_drained = true;
+                    return Ok(stats);
+                }
                 tokio::time::sleep(cfg.poll_idle).await;
                 continue;
             }
@@ -268,6 +307,14 @@ pub async fn run_agent(
             .await?;
 
         if grant.is_empty() {
+            // The terminal answer: the coordinator can see the queue, and it holds
+            // nothing pending and nothing leased elsewhere. Exiting here is what lets a
+            // provisioned spot box stop costing money when the batch is done; polling on
+            // would burn a GPU for as long as the fleet stayed up.
+            if grant.drained {
+                stats.queue_drained = true;
+                return Ok(stats);
+            }
             stats.idle_polls += 1;
             consecutive_idle += 1;
             if cfg.max_idle_polls != 0 && consecutive_idle >= cfg.max_idle_polls {
@@ -283,7 +330,7 @@ pub async fn run_agent(
         // and let it pace; no `spawn`/`Arc` (the futures borrow `&worker`/`&coord`),
         // mirroring the coordinator's dispatch idiom. The batch finishes even once
         // `drain` flips — that *is* the in-flight drain.
-        let batch = stream::iter(grant)
+        let batch = stream::iter(grant.items)
             .map(|w| async move {
                 let item = wire_to_item(&w);
                 let result = match worker.submit(&item).await {
@@ -443,7 +490,7 @@ impl InProcessCoordinator {
 }
 
 impl Coordinator for InProcessCoordinator {
-    async fn pull(&self, req: &LeasePull) -> Result<Vec<WireItem>, ForgeError> {
+    async fn pull(&self, req: &LeasePull) -> Result<LeaseGrant, ForgeError> {
         let mut g = self.inner.lock().unwrap();
         let take = (req.max as usize).min(g.pending.len());
         let batch: Vec<WireItem> = g.pending.drain(..take).collect();
@@ -453,7 +500,21 @@ impl Coordinator for InProcessCoordinator {
                 d.signal();
             }
         }
-        Ok(batch)
+        // Empty is the truthful terminal answer for this double: its `pending` IS the
+        // whole queue, so it holds nothing leased elsewhere to come back.
+        //
+        // `batch.is_empty()` as well, mirroring the HTTP coordinator's
+        // `items.is_empty() && counts().is_drained()`. Without it the final pull —
+        // which empties `pending` and hands the items back — reports a *non-empty*
+        // grant as drained, a shape no shipped coordinator produces. `run_agent` reads
+        // the flag only inside `if grant.is_empty()`, so nothing acts on it today; a
+        // double that can emit states the real thing cannot is a trap for whoever
+        // writes the next consumer against it.
+        let drained = batch.is_empty() && g.pending.is_empty();
+        Ok(LeaseGrant {
+            items: batch,
+            drained,
+        })
     }
 
     async fn post(&self, result: &ResultPost) -> Result<(), ForgeError> {
@@ -496,6 +557,15 @@ mod tests {
             Self {
                 spec: WorkerSpec::new("gpu1", "http://localhost", forge_core::EndpointKind::Chat),
                 ready: AtomicBool::new(true),
+                fail: false,
+            }
+        }
+        /// An engine that never comes back. `probe` defaults to `is_ready`, so this
+        /// stays down for the life of the run — a preempted or OOM'd box.
+        fn dead() -> Self {
+            Self {
+                spec: WorkerSpec::new("gpu1", "http://localhost", forge_core::EndpointKind::Chat),
+                ready: AtomicBool::new(false),
                 fail: false,
             }
         }
@@ -588,6 +658,170 @@ mod tests {
             coord.remaining_ids().len(),
             6,
             "the rest stay leased for lease-expiry re-queue, not lost"
+        );
+    }
+
+    /// A coordinator that is never drained and never has work: the shape of a fleet
+    /// whose last items are leased to another box. The agent must NOT exit.
+    struct BusyElsewhere;
+
+    impl Coordinator for BusyElsewhere {
+        async fn pull(&self, _req: &LeasePull) -> Result<LeaseGrant, ForgeError> {
+            Ok(LeaseGrant::empty())
+        }
+        async fn post(&self, _result: &ResultPost) -> Result<(), ForgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drained_grant_ends_the_run_so_a_spot_box_stops_billing() {
+        // No items at all, and the coordinator says the queue holds nothing: the
+        // batch is finished, so the loop must return rather than poll a GPU forever.
+        let coord = InProcessCoordinator::with_items(std::iter::empty());
+        let worker = FakeWorker::ok();
+        let drain = Drain::new();
+
+        let mut c = cfg();
+        c.max_idle_polls = 0; // the heuristic is off; only the fact may end this
+
+        let stats = run_agent(&c, &coord, &worker, &drain).await.expect("run");
+        assert!(
+            stats.queue_drained,
+            "exited on the coordinator's drained flag"
+        );
+        assert!(!stats.drained, "not a spot-notice exit");
+        assert_eq!(stats.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_but_undrained_grant_keeps_polling() {
+        // The distinction the flag exists for: empty means "nothing for you now",
+        // and exiting on it would strand an item a dying box hands back. With the
+        // heuristic off, the only way out here is the drain latch.
+        let worker = FakeWorker::ok();
+        let drain = Drain::new();
+        let mut c = cfg();
+        c.max_idle_polls = 0;
+        c.poll_idle = Duration::from_millis(5);
+
+        let run = run_agent(&c, &BusyElsewhere, &worker, &drain);
+        let timed = tokio::time::timeout(Duration::from_millis(120), run).await;
+        assert!(
+            timed.is_err(),
+            "an empty-but-not-drained grant must not end the run"
+        );
+
+        // ...and the latch still ends it, so this is a poll loop and not a hang.
+        drain.signal();
+        let stats = run_agent(&c, &BusyElsewhere, &worker, &drain)
+            .await
+            .expect("run");
+        assert!(stats.drained);
+        assert!(!stats.queue_drained);
+    }
+
+    /// A coordinator that hands back its last item and marks the same grant drained —
+    /// the shape the in-process double used to emit, and one a future coordinator could
+    /// emit again. `drained` is a statement about the queue, never a licence to drop
+    /// work already granted.
+    struct DrainedWithWork(std::sync::Mutex<Vec<WireItem>>);
+
+    impl Coordinator for DrainedWithWork {
+        async fn pull(&self, _req: &LeasePull) -> Result<LeaseGrant, ForgeError> {
+            let items: Vec<WireItem> = self.0.lock().unwrap().drain(..).collect();
+            // Set even when items ride along, which is the whole point of the test.
+            Ok(LeaseGrant {
+                items,
+                drained: true,
+            })
+        }
+        async fn post(&self, _result: &ResultPost) -> Result<(), ForgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_that_still_carries_work_is_never_the_end_of_the_run() {
+        // `run_agent` reads `drained` only inside `if grant.is_empty()`, and that
+        // nesting is load-bearing: a grant carrying the batch's last item must be
+        // processed, not discarded because the queue behind it is now empty. Exiting
+        // here would silently lose finished-but-unsubmitted work — the failure mode
+        // this whole change exists to avoid, arrived at from the other direction.
+        let coord = DrainedWithWork(std::sync::Mutex::new(vec![wire("last")]));
+        let worker = FakeWorker::ok();
+        let drain = Drain::new();
+
+        let mut c = cfg();
+        c.max_idle_polls = 0; // only the flag may end this run
+
+        let stats = run_agent(&c, &coord, &worker, &drain).await.expect("run");
+        assert_eq!(
+            stats.processed, 1,
+            "the item that rode along with the drained flag was dropped"
+        );
+        // And the run still ends — on the NEXT grant, which is empty and drained.
+        assert!(stats.queue_drained);
+        assert!(!stats.drained, "not a spot-notice exit");
+    }
+
+    #[tokio::test]
+    async fn a_dead_engine_does_not_outlive_the_batch_it_can_no_longer_serve() {
+        // The health gate is the one path that skips the pull, so it was also the one
+        // path where the drained flag never arrived. A spot box whose engine died then
+        // billed until a human noticed — the same failure this change fixes, through
+        // the door the gate left open.
+        let coord = InProcessCoordinator::with_items(std::iter::empty());
+        let worker = FakeWorker::dead();
+        let drain = Drain::new();
+
+        let mut c = cfg();
+        c.max_idle_polls = 0; // the heuristic is off; only the fact may end this
+        c.poll_idle = Duration::from_millis(5);
+
+        let stats = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_agent(&c, &coord, &worker, &drain),
+        )
+        .await
+        .expect("a dead engine must not keep the agent alive on a drained queue")
+        .expect("run");
+
+        assert!(
+            stats.queue_drained,
+            "exited on the coordinator's drained flag"
+        );
+        assert_eq!(stats.processed, 0, "a dead engine processes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_dead_engine_keeps_waiting_while_work_remains() {
+        // The other half, and the reason the gate cannot simply exit: work is still
+        // queued, so the engine may yet come back to serve it. Leaving here would
+        // strand the batch.
+        let coord = InProcessCoordinator::with_items((0..2).map(|i| wire(&format!("c{i}"))));
+        let worker = FakeWorker::dead();
+        let drain = Drain::new();
+
+        let mut c = cfg();
+        c.max_idle_polls = 0;
+        c.poll_idle = Duration::from_millis(5);
+
+        let timed = tokio::time::timeout(
+            Duration::from_millis(120),
+            run_agent(&c, &coord, &worker, &drain),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "an undrained queue must keep the agent waiting"
+        );
+
+        // And nothing was leased into the dead engine on the way: `max: 0` asks only.
+        assert_eq!(
+            coord.remaining_ids().len(),
+            2,
+            "the probe leased work it could not run"
         );
     }
 

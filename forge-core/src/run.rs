@@ -19,6 +19,35 @@ use crate::types::{Item, ItemResult, JobTotals, TokenUsage};
 /// TTL — enough headroom that a slow-but-healthy generation isn't re-queued under it.
 const LEASE_LATENCY_FACTOR: u64 = 2;
 
+/// Blocking-pool ceiling for every forge process. See [`runtime`].
+pub const MAX_BLOCKING_THREADS: usize = 16;
+
+/// The runtime every forge binary runs on — one place decides how a forge process is
+/// scheduled, the way `init_logging` decides how one logs.
+///
+/// It exists for one line: `max_blocking_threads`. Tokio's default is **512**, and
+/// every queue operation is a `spawn_blocking` (SQLite is synchronous) that then takes
+/// the queue's single `Mutex<Connection>`. The window below keeps up to
+/// `Σ worker concurrency` items in flight — 1024 in the scale bench — so ~1024 blocking
+/// closures queue at once and tokio answers by spawning threads until it hits its
+/// ceiling. Measured at N=50k, 64 workers: 518 threads and **349 MiB** peak RSS, of
+/// which 5.4 GiB/1M-items' worth was glibc per-thread malloc arenas (one 64 MiB arena
+/// per thread, capped at `8 × ncores`, dirty pages never returned to the OS — so it
+/// climbs with core count, not with N, which is why CI never saw it).
+///
+/// The threads bought **nothing**: throughput is flat from 2 to 512 (251–269 items/s)
+/// because the connection mutex serialises them anyway. At 16 the same run peaks at
+/// 46 MiB and is marginally the *fastest* of the set, while leaving ~8× headroom over
+/// the measured need (~2) for the other blocking users — `tokio::fs` writes in
+/// forge-store and a multi-tenant intake — so nothing queues behind queue ops.
+pub fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .build()
+        .expect("tokio runtime")
+}
+
 /// The effective lease TTL for the next round. Grows the configured `base` toward
 /// `max` once observed latency suggests the fixed TTL would expire while a slow
 /// generation is still in flight (which would wastefully re-dispatch a healthy

@@ -118,9 +118,8 @@ impl HttpCoordinator {
 }
 
 impl Coordinator for HttpCoordinator {
-    async fn pull(&self, req: &LeasePull) -> Result<Vec<WireItem>, ForgeError> {
-        let grant: LeaseGrant = self.post_json("/v1/lease", req).await?;
-        Ok(grant.items)
+    async fn pull(&self, req: &LeasePull) -> Result<LeaseGrant, ForgeError> {
+        self.post_json("/v1/lease", req).await
     }
 
     async fn post(&self, result: &ResultPost) -> Result<(), ForgeError> {
@@ -279,8 +278,14 @@ where
             let items = rt
                 .block_on(queue.lease(pull.max as usize, lease_for))
                 .map_err(internal)?;
+            // Only asked when the grant is empty, because that is the only case an
+            // agent cannot answer for itself — and it costs a `counts()` round-trip,
+            // which is not worth paying on every busy lease.
+            let drained =
+                items.is_empty() && rt.block_on(queue.counts()).map_err(internal)?.is_drained();
             let grant = LeaseGrant {
                 items: items.iter().map(item_to_wire).collect(),
+                drained,
             };
             serde_json::to_string(&grant).map_err(internal)
         }

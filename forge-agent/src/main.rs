@@ -53,7 +53,8 @@ enum Cmd {
     },
 
     /// Run the agent: lease from a remote coordinator, run a local engine, drain on a
-    /// spot notice (with `--cloud`). Exits when the run drains or a notice fires.
+    /// spot notice (with `--cloud`). Exits when the coordinator reports the queue
+    /// empty of work (nothing pending, nothing leased anywhere) or a notice fires.
     Run {
         /// Coordinator base URL (e.g. http://coordinator:8080).
         #[arg(long)]
@@ -121,8 +122,13 @@ fn endpoint_kind(s: &str) -> anyhow::Result<EndpointKind> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // The blocking pool is capped here rather than left at tokio's 512 — see
+    // `forge_core::runtime`.
+    forge_core::runtime().block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -195,7 +201,11 @@ async fn main() -> anyhow::Result<()> {
                 max_lease: concurrency,
                 lease_secs,
                 poll_idle: Duration::from_secs(1),
-                max_idle_polls: 0, // a daemon: run until a notice drains it
+                // 0 = never exit on the empty-grant heuristic. The exit that matters is
+                // the coordinator's `drained` flag, which is a fact rather than a guess;
+                // this fallback only fires against a coordinator too old to send it, and
+                // guessing "finished" from "empty" can strand a re-queued item.
+                max_idle_polls: 0,
             };
             let watcher = CloudSource::parse(&cloud).map_err(|e| anyhow::anyhow!(e))?;
 

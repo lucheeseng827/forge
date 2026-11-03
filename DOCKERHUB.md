@@ -52,16 +52,16 @@ GPUs; your engines stay where they are, and the boxes on the right are yours.
 
 | Tag | What |
 |---|---|
-| `latest`, `v0.1.2` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
-| `v0.1.2-amd64`, `v0.1.2-arm64` (and prior versions) | pinned single-arch |
+| `latest`, `v0.2.0` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
+| `v0.2.0-amd64`, `v0.2.0-arm64` (and prior versions) | pinned single-arch |
 
 ## Quick start — run a batch
 
 ```sh
 # input.jsonl: one OpenAI Batch-format request per line, keyed by custom_id
-docker run --rm --network host \
+docker run --rm --network host --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" -w /work \
-  mancube/forge:v0.1.2 \
+  mancube/forge:v0.2.0 \
   run --input input.jsonl \
       --workers http://gpu1:8000,http://gpu2:8000 \
       --engine vllm --concurrency 256 \
@@ -73,20 +73,23 @@ Kill it mid-run (or lose the box) and run the same command again — it
 re-run, and `verify` proves every input id reached a terminal result.
 
 ```sh
-docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.2 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/forge:v0.2.0 \
   status --checkpoint state.db          # counts, success rate, failure mix
-docker run --rm -v "$PWD:/work" -w /work mancube/forge:v0.1.1 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/forge:v0.2.0 \
   verify --input input.jsonl --results results.jsonl
 ```
 
-The mounted directory must be writable by uid `65532` (the image's nonroot
-user), or add `--user "$(id -u)"`.
+`--user` runs the container as the owner of the directory you mount. The image's
+own user (uid `65532`) owns nothing on your machine or a CI runner, so without it
+forge cannot create its checkpoint there and stops with
+`unable to open database file`. Later images also say which directory is not
+writable.
 
 ## Quick start — the OpenAI Batch REST front door
 
 ```sh
 docker run --rm -p 8080:8080 -v forge-data:/data \
-  mancube/forge:v0.1.1 \
+  mancube/forge:v0.2.0 \
   serve-batch --listen 0.0.0.0:8080 --data-dir /data \
     --workers http://gpu1:8000 --engine vllm --concurrency 256 \
     --api-key "$FORGE_API_KEY"
@@ -105,7 +108,7 @@ the unauthenticated liveness route; everything else requires the bearer key.
 The chart is published as an OCI artifact right beside this image:
 
 ```sh
-helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.2 \
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.2.0 \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
   --set 'serveBatch.apiKey=<bearer key>'
 ```

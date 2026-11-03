@@ -66,12 +66,38 @@ pub struct WireItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LeaseGrant {
     pub items: Vec<WireItem>,
+    /// The queue holds no further work: nothing pending, nothing leased elsewhere.
+    ///
+    /// Distinct from `items.is_empty()`, and the distinction is the whole point. An
+    /// empty grant only says "nothing for you *this instant*" — another box may be
+    /// holding the last items, and its lease may yet expire back onto the queue. Only
+    /// the coordinator can tell the two apart, because only it can see the queue. An
+    /// agent that treats "empty" as "finished" either exits while work is still in
+    /// flight (stranding whatever a dying box hands back) or, if it never exits, keeps
+    /// a spot GPU running, and paid for, after the batch is done.
+    ///
+    /// `#[serde(default)]` so the field is compatible both ways: a new agent polling an
+    /// older coordinator reads `false` and falls back to `max_idle_polls`, and an older
+    /// agent ignores it.
+    #[serde(default)]
+    pub drained: bool,
 }
 
 impl LeaseGrant {
-    /// An empty grant (nothing ready).
+    /// An empty grant (nothing ready *now*; the queue may still hold leased work).
     pub fn empty() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            items: Vec::new(),
+            drained: false,
+        }
+    }
+
+    /// An empty grant for a queue with nothing left at all — the terminal answer.
+    pub fn drained() -> Self {
+        Self {
+            items: Vec::new(),
+            drained: true,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -179,10 +205,26 @@ mod tests {
                 lease_generation: 7,
                 attempts: 1,
             }],
+            drained: false,
         };
         assert_eq!(g, roundtrip(&g));
         assert!(!g.is_empty());
         assert!(LeaseGrant::empty().is_empty());
+    }
+
+    #[test]
+    fn drained_defaults_to_false_so_an_older_coordinator_stays_readable() {
+        // A coordinator built before the field existed sends no `drained`. It must
+        // deserialize as "not drained" — the safe reading, which leaves the agent
+        // polling instead of exiting on someone else's in-flight work.
+        let g: LeaseGrant = serde_json::from_str(r#"{"items":[]}"#).expect("legacy grant");
+        assert!(g.is_empty());
+        assert!(!g.drained);
+
+        // And the terminal answer round-trips.
+        let d = LeaseGrant::drained();
+        assert!(d.is_empty() && d.drained);
+        assert_eq!(d, roundtrip(&d));
     }
 
     #[test]

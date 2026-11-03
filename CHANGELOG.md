@@ -6,6 +6,58 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-27
+
+Everything here merged **after** the v0.2.0 tag was cut on 2026-09-10 and is therefore
+absent from the published artifact. The first item is the reason this release exists
+rather than waiting: `BENCHMARKS.md` was updated in the same commit as the fix, so the
+published binary cannot reproduce the numbers the published docs quote. A release is the
+correction.
+
+### Fixed
+
+- **The Docker image's quick starts failed on any directory uid 65532 did not own.**
+  With `-v "$PWD:/work"`, forge stopped with `queue: unable to open database file:
+  state.db` and nothing about why; with the `serve-batch` quick start's named volume
+  (`-v forge-data:/data`), the image had no `/data`, so Docker created it root-owned and
+  forge could not write its own data dir. DOCKERHUB.md now runs the container as the
+  directory's owner (`--user "$(id -u):$(id -g)"`), the image ships a `/data` owned by
+  its user, and a checkpoint that cannot be opened in an unwritable directory now says
+  so, with that advice. CI now builds the image and runs those quick starts against
+  directories the image does not own.
+- **The queue was sorting its entire pending set once per leased item** —
+  7.7 → **2,830 items/s** at N=1M. `LEASE_SQL` selected on
+  `status = 'pending' OR (status = 'leased' AND leased_until < ?)` ordered by `rowid`.
+  No index can serve both that `OR` and that ordering, so SQLite answered with
+  `MULTI-INDEX OR` plus `USE TEMP B-TREE FOR ORDER BY` and sorted the whole matching set
+  before `LIMIT` applied. `BatchRun` consumes one completion per iteration and
+  immediately tops the freed slot back up — the sliding window, deliberately — so a
+  steady-state run leases once per item, and each lease paid for a full sort of the
+  pending set.
+
+  The symptom was not an error: an N=1M soak reached 91,163 items in 3h17m and wrote
+  2.06 GB for them, 22 KB each, none of it result data. It looked like a slow run.
+
+- **`forge-agent run` never exited on a drained queue, so a spot fleet kept paying for
+  idle GPUs after its batch finished.** The command's own help said "Exits when the run
+  drains or a notice fires"; `main.rs` set `max_idle_polls: 0` and no flag could change
+  it. Measured on a two-agent run: 400 items finished in seconds, and both agents then
+  sat at 0% CPU until killed ten minutes later. Anything that provisions spot boxes to
+  run this command and releases each box when the command exits kept every one of them,
+  and its accelerator, running for as long as nobody noticed.
+
+  The reason it could not simply idle-exit is the interesting half: an agent cannot
+  distinguish "the batch is finished" from "another box holds the last items" — both
+  look like an empty grant, and guessing from consecutive empty polls gets one of the
+  two cases wrong every time. Only the coordinator can see the queue, and it already
+  computed the answer (`QueueCounts::is_drained`); the fix is to stop discarding it.
+
+- **The blocking pool is capped at 16.**
+
+### Added
+
+- **A GPU load-test bed** — real inference against real spot interruptions.
+
 ## [0.2.0] — 2026-09-10
 
 ### Fixed
@@ -391,7 +443,8 @@ interruptions, and prove completeness — as a single static binary.
   OpenAI SDK code runs its batch flow against your own endpoints, with real
   per-item progress and mid-run partial results.
 
-[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/lucheeseng827/forge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lucheeseng827/forge/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lucheeseng827/forge/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/lucheeseng827/forge/compare/v0.1.0...v0.1.1

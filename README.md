@@ -9,6 +9,13 @@ llama.cpp, Ollama, …) on your own (spot) GPUs, **or hosted provider APIs**
 interruptions, and aggregates results cheaply. It is a **narrow batch-inference
 work distributor** — explicitly **NOT** a workflow/DAG scheduler.
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/lucheeseng827/forge?sort=semver&label=release)](https://github.com/lucheeseng827/forge/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/lucheeseng827/forge/ci.yml?label=ci)](https://github.com/lucheeseng827/forge/actions/workflows/ci.yml)
+[![Images](https://img.shields.io/github/actions/workflow/status/lucheeseng827/forge/docker.yml?label=images)](https://github.com/lucheeseng827/forge/actions/workflows/docker.yml)
+[![Docker pulls](https://img.shields.io/docker/pulls/mancube/forge)](https://hub.docker.com/r/mancube/forge)
+[![Image size](https://img.shields.io/docker/image-size/mancube/forge?sort=semver&label=image)](https://hub.docker.com/r/mancube/forge)
+
 ## The gap
 
 Offline batch inference is ~5–10× cheaper per token than online serving (higher

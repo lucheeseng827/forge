@@ -36,6 +36,43 @@ fn q(e: impl std::fmt::Display) -> ForgeError {
     ForgeError::Queue(e.to_string())
 }
 
+/// SQLite says only "unable to open database file" when it cannot create the checkpoint,
+/// or the `-wal`/`-shm` files WAL keeps beside it. The usual cause is a directory this
+/// process cannot write — in a container, a mounted directory owned by another uid than
+/// the image's — so when that is the case, say so.
+fn open_err(path: &Path, e: rusqlite::Error) -> ForgeError {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let probe = dir.join(format!(".forge-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            q(e)
+        }
+        // EACCES, or EROFS (30) for a read-only mount.
+        Err(io)
+            if io.kind() == std::io::ErrorKind::PermissionDenied
+                || io.raw_os_error() == Some(30) =>
+        {
+            ForgeError::Queue(format!(
+                "{e}: {} is not writable by this process ({io}), and the checkpoint and its \
+                 -wal/-shm files live there. In a container, run as the directory's owner: \
+                 --user \"$(id -u):$(id -g)\"",
+                std::fs::canonicalize(dir)
+                    .unwrap_or_else(|_| dir.to_path_buf())
+                    .display()
+            ))
+        }
+        Err(_) => q(e),
+    }
+}
+
 fn join_err(e: tokio::task::JoinError) -> ForgeError {
     ForgeError::Queue(format!("blocking task: {e}"))
 }
@@ -159,7 +196,7 @@ impl SqliteQueue {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let conn = Connection::open(path).map_err(q)?;
+        let conn = Connection::open(path).map_err(|e| open_err(path, e))?;
         // WAL: concurrent readers (status/sweep) alongside the single writer.
         // busy_timeout: ride out brief contention rather than erroring (a known
         // failure mode of batch tools sharing a SQLite file). synchronous=NORMAL: durable under WAL with
@@ -170,7 +207,7 @@ impl SqliteQueue {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )
-        .map_err(q)?;
+        .map_err(|e| open_err(path, e))?;
         conn.execute_batch(SCHEMA).map_err(q)?;
         // Migration for checkpoints created before the job table carried the fleet
         // config: adding a column that already exists is the only failure mode, so
@@ -541,7 +578,9 @@ CREATE TABLE IF NOT EXISTS items (
     leased_by    TEXT,
     last_error   TEXT
 );
--- The lease/reaper hot path scans by (status, leased_until).
+-- The lease/reaper hot path scans by (status, leased_until). Its implicit trailing
+-- rowid is load-bearing: it is what lets the lease read insertion order straight out
+-- of the index instead of sorting the whole pending set. See LEASE_SQL.
 CREATE INDEX IF NOT EXISTS idx_items_status ON items(status, leased_until);
 
 CREATE TABLE IF NOT EXISTS job (
@@ -574,7 +613,66 @@ CREATE TABLE IF NOT EXISTS shards (
 // Single-writer lease, emulating SELECT ... FOR UPDATE SKIP LOCKED. The subquery
 // is fully materialised before the UPDATE applies (SQLite semantics), so picking
 // and claiming the rows is atomic under the one writer. Picks fresh `pending`
-// rows AND `leased` rows whose lease has expired (a dead/spot-killed worker).
+// rows AND `leased` rows whose lease has expired (a dead/spot-killed worker),
+// oldest-first by insertion order across both sets — with one stated exception, at
+// the end of this comment.
+//
+// **Why the two branches are separate, and why neither says `ORDER BY rowid`.**
+// This began as one predicate — `status = 'pending' OR (status = 'leased' AND
+// leased_until < ?)` — with `ORDER BY rowid LIMIT ?`. Correct, and quadratic: no
+// index can serve both that `OR` and an ordering on `rowid`, so SQLite answered
+// `MULTI-INDEX OR` + `USE TEMP B-TREE FOR ORDER BY` and sorted the **entire**
+// pending set on every call before the `LIMIT` bit. Since `BatchRun` leases once
+// per completion, that is a full sort per item: at 1M queued it cost 211 ms to
+// return ONE row, and the fan-out bench managed 7.7 items/s against 269 at 50k
+// (BENCHMARKS.md).
+//
+// The fix is to ask for the order the index already has. `idx_items_status` is
+// `(status, leased_until)`, so under an equality on `status` its entries are
+// ordered by `leased_until` and then — via the index's implicit trailing rowid —
+// by `rowid`. `ORDER BY leased_until, rowid` is therefore satisfied by a scan
+// with early exit, while `ORDER BY rowid` alone is not (SQLite cannot prove
+// `leased_until` is constant, so it sorts). Every pending row has
+// `leased_until IS NULL`, so within that branch the two orderings are the same
+// rows in the same order — insertion order, which `--prefix-bucket` relies on.
+//
+// Splitting the `OR` into two `LIMIT`-ed branches keeps each one index-served;
+// the outer `ORDER BY rid` then interleaves at most `2 × limit` rows, which is
+// the sort SQLite still reports and which costs nothing at that size — 0.115 ms
+// instead of 211 ms, and flat in queue size rather than linear.
+//
+// **Where selection differs from the single-predicate form, and why that is
+// acceptable.** Each branch applies its own `LIMIT`, and the expired branch is
+// ordered by `leased_until` rather than by `rowid`. So when MORE than `limit`
+// leases have expired AND they carry DISTINCT `leased_until` values, that branch
+// offers the oldest leases rather than the lowest rowids, and the outer interleave
+// can therefore return a different set than `ORDER BY rowid` over the whole `OR`
+// would have.
+//
+// Both conditions are needed. At or below the cap the branch drops nothing, so
+// the two forms agree by construction; one row over is enough to part them. That
+// is why the 1M cross-check recorded in BENCHMARKS.md matched row-for-row and
+// could not have done otherwise: it offered 500 expired rows against a limit of
+// 1024, leaving the branch 524 short of its cap. The second condition is what
+// makes the first bite — expirations from several different lease calls, most
+// sharply a retried row whose renewed lease is younger than its neighbours'
+// despite its low rowid.
+//
+// Nothing is lost when it happens: every row the branch passed over is still
+// expired, still eligible, and reclaimed by a later call once the backlog ahead of
+// it drains (re-leasing moves a row's `leased_until` into the future, so the
+// expired set strictly shrinks). What changes is reclaim ORDER — oldest-lease-first
+// instead of lowest-rowid-first — and the only thing riding on that is the
+// cache-locality `--prefix-bucket` buys, which a reclaimed row has already left
+// behind by being reclaimed at all. The pending branch, which is the hot path and
+// the one `--prefix-bucket` is about, is exactly insertion-ordered: every write
+// that sets `status = 'pending'` also sets `leased_until = NULL` (the reaper and
+// the dead-letter requeue both do), and `enqueue` never writes the column.
+//
+// `rowid` is not indexable here (the table's primary key is `custom_id TEXT`, so
+// `CREATE INDEX ... ON items(rowid)` is `no such column: rowid`); the index's
+// implicit rowid is the only handle on insertion order, which is why the ORDER BY
+// has to be phrased to reach it.
 const LEASE_SQL: &str = "
 UPDATE items
    SET status       = 'leased',
@@ -582,10 +680,24 @@ UPDATE items
        leased_by    = ?2,
        attempts     = attempts + 1
  WHERE custom_id IN (
-       SELECT custom_id FROM items
-        WHERE status = 'pending'
-           OR (status = 'leased' AND leased_until IS NOT NULL AND leased_until < ?3)
-        ORDER BY rowid
+       SELECT custom_id FROM (
+           SELECT * FROM (
+               SELECT custom_id, rowid AS rid FROM items
+                WHERE status = 'pending'
+                ORDER BY leased_until, rowid
+                LIMIT ?4
+           )
+           UNION ALL
+           SELECT * FROM (
+               SELECT custom_id, rowid AS rid FROM items
+                WHERE status = 'leased'
+                  AND leased_until IS NOT NULL
+                  AND leased_until < ?3
+                ORDER BY leased_until, rowid
+                LIMIT ?4
+           )
+       )
+        ORDER BY rid
         LIMIT ?4
  )
 RETURNING custom_id, method, url, body, attempts, leased_until, leased_by, last_error
@@ -905,6 +1017,173 @@ mod tests {
         assert_eq!(q.counts().await.unwrap().total(), 2);
     }
 
+    /// The guard on the quadratic lease. `ORDER BY rowid` over the `OR` predicate made
+    /// SQLite sort the whole pending set on every lease — 211 ms to return one row at
+    /// 1M queued, and the fan-out bench fell from 269 items/s to 7.7 (BENCHMARKS.md).
+    /// The plan, not a stopwatch, is what pins it: each branch must be an index SEARCH,
+    /// and the only sort allowed is the outer interleave of at most `2 × limit` rows.
+    #[tokio::test]
+    async fn the_lease_reads_insertion_order_out_of_the_index_and_does_not_sort_the_queue() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(&[item("a"), item("b"), item("c")]).await.unwrap();
+
+        let plan: Vec<String> = {
+            let conn = q.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {LEASE_SQL}"))
+                .expect("explain");
+            let rows = stmt
+                .query_map(params![0i64, "c", 0i64, 1i64], |r| r.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("plan rows");
+            rows
+        };
+        let plan_text = plan.join("\n");
+
+        let searches = plan
+            .iter()
+            .filter(|l| l.contains("USING INDEX idx_items_status"))
+            .count();
+        assert_eq!(
+            searches, 2,
+            "both lease branches must be served by idx_items_status; plan was:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SCAN items"),
+            "the lease must never table-scan; plan was:\n{plan_text}"
+        );
+        // The shape this replaced: one predicate whose two index searches feed a
+        // single UNCAPPED row set, which the `ORDER BY` then sorts whole. Without
+        // this line the test passes against that statement — the sort below is one
+        // either way, and only its input size differs.
+        assert!(
+            !plan_text.contains("MULTI-INDEX OR"),
+            "the two lookups must stay separately LIMIT-ed, not be OR-unioned into one \
+             unbounded set; plan was:\n{plan_text}"
+        );
+        // Exactly one sort, and — given the assertion above — it is the outer
+        // interleave of the two capped branches, so at most `2 × limit` rows. A
+        // second one means a branch went back to sorting its whole result set.
+        let sorts = plan
+            .iter()
+            .filter(|l| l.contains("USE TEMP B-TREE FOR ORDER BY"))
+            .count();
+        assert!(
+            sorts <= 1,
+            "a lease branch is sorting again (expect at most the outer interleave); plan was:\n{plan_text}"
+        );
+    }
+
+    /// Insertion order is the contract `--prefix-bucket` buys: it reorders the input so
+    /// prefix-similar items are adjacent, which only pays off if the lease hands them
+    /// out in that order.
+    #[tokio::test]
+    async fn leases_follow_insertion_order_not_custom_id_order() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        // Ids deliberately descending, so id order and insertion order disagree.
+        q.enqueue(&[item("z"), item("y"), item("x"), item("w")])
+            .await
+            .unwrap();
+
+        let first = q.lease(2, Duration::from_secs(300)).await.unwrap();
+        let ids: Vec<&str> = first.iter().map(|i| i.custom_id.as_str()).collect();
+        assert_eq!(ids, vec!["z", "y"], "insertion order, not sorted by id");
+
+        let second = q.lease(2, Duration::from_secs(300)).await.unwrap();
+        let ids: Vec<&str> = second.iter().map(|i| i.custom_id.as_str()).collect();
+        assert_eq!(ids, vec!["x", "w"]);
+    }
+
+    /// One lease call must serve both sets — fresh work and a dead worker's expired
+    /// lease — interleaved in insertion order, which is what the two-branch UNION has
+    /// to preserve.
+    #[tokio::test]
+    async fn one_lease_takes_expired_leases_and_pending_work_in_insertion_order() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(&[item("a"), item("b"), item("c"), item("d")])
+            .await
+            .unwrap();
+
+        // "a" and "b" go to a worker that then dies: a zero-length lease is expired
+        // the moment it is taken.
+        let dead = q.lease(2, Duration::from_millis(0)).await.unwrap();
+        assert_eq!(dead.len(), 2);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // A fresh lease for everything: the two expired rows come first (they were
+        // inserted first), then the never-leased ones.
+        let all = q.lease(4, Duration::from_secs(300)).await.unwrap();
+        let ids: Vec<&str> = all.iter().map(|i| i.custom_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        // The reclaimed pair carries its second attempt; the fresh pair its first.
+        assert_eq!(all[0].attempts, 2);
+        assert_eq!(all[1].attempts, 2);
+        assert_eq!(all[2].attempts, 1);
+        assert_eq!(all[3].attempts, 1);
+        assert_eq!(q.counts().await.unwrap().leased, 4);
+    }
+
+    /// The one case where selection differs from the single-predicate `ORDER BY rowid`
+    /// form the lease replaced: when more expired leases are on offer than the limit,
+    /// the expired branch takes the OLDEST leases rather than the lowest rowids. Pinned
+    /// because it is a real behaviour change, and because the argument for accepting it
+    /// is that nothing is lost — which is the second half of this test.
+    #[tokio::test]
+    async fn a_saturated_expired_branch_takes_the_oldest_leases_not_the_lowest_rowids() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(&[item("a"), item("b"), item("c"), item("d")])
+            .await
+            .unwrap();
+
+        // All four are expired leases held by a worker that died, but "a" — the lowest
+        // rowid — was retried last, so its lease is the youngest of the four. Written
+        // straight into the row: leasing and sleeping to build this would be pinning
+        // the scheduler rather than the statement.
+        {
+            let conn = q.conn.lock().unwrap();
+            for (id, until) in [("a", 40i64), ("b", 10), ("c", 20), ("d", 30)] {
+                let n = conn
+                    .execute(
+                        "UPDATE items
+                            SET status = 'leased', leased_until = ?2, leased_by = 'dead'
+                          WHERE custom_id = ?1",
+                        params![id, until],
+                    )
+                    .expect("seed expired lease");
+                assert_eq!(n, 1, "seeding {id} matched no row");
+            }
+        }
+
+        // Every one of those `leased_until` values is long past, so all four are
+        // eligible and only two fit. Sorted because what is under test is which rows
+        // the statement picks, not the order `RETURNING` hands them back in.
+        let mut ids: Vec<String> = q
+            .lease(2, Duration::from_secs(300))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.custom_id)
+            .collect();
+        ids.sort();
+        // `ORDER BY rowid` over the whole `OR` would have said ["a", "b"].
+        assert_eq!(ids, vec!["b", "c"]);
+
+        // Nothing is lost by passing "a" over: it is still expired, still eligible, and
+        // comes back on the very next call. Re-leasing only ever moves `leased_until`
+        // forward, so a row cannot be starved by rows that keep overtaking it.
+        let mut ids: Vec<String> = q
+            .lease(2, Duration::from_secs(300))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.custom_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "d"]);
+        assert_eq!(q.counts().await.unwrap().leased, 4);
+    }
+
     #[tokio::test]
     async fn reaper_requeues_expired_leases() {
         let q = SqliteQueue::open_in_memory().unwrap();
@@ -982,6 +1261,32 @@ mod tests {
         assert_eq!(audit.live_leases, 1);
         assert_eq!(audit.orphaned_leases, 1);
         assert_eq!(counts.pending, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unwritable_checkpoint_directory_is_named() {
+        // What the image's quick start hit on any mounted directory it did not own:
+        // "queue: unable to open database file: state.db", and nothing about why.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("forge-ckpt-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // root writes anywhere, so there is nothing to see as root.
+        let as_root = std::fs::write(dir.join("probe"), b"").is_ok();
+        let res = SqliteQueue::open(dir.join("state.db"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        if as_root {
+            return;
+        }
+        let err = res
+            .err()
+            .expect("a checkpoint in a read-only directory must not open");
+        let msg = err.to_string();
+        assert!(msg.contains("is not writable by this process"), "{msg}");
+        assert!(msg.contains("--user"), "{msg}");
     }
 
     #[test]

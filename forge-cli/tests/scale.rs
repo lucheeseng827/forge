@@ -197,9 +197,25 @@ fn item(i: usize) -> Item {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "large-N benchmark; run with `--ignored --nocapture`"]
-async fn fan_out_at_scale_completes() {
+fn fan_out_at_scale_completes() {
+    // Built by hand rather than `#[tokio::test]` for one reason: the attribute cannot
+    // set `max_blocking_threads`, so this bench used to measure tokio's 512-thread
+    // default — a configuration no forge binary runs (see `forge_core::runtime`). With
+    // 1024 items in flight and every queue op a `spawn_blocking`, that default cost
+    // 518 threads and 349 MiB at N=50k where the shipped ceiling costs 46 MiB, at
+    // identical throughput. Worker threads stay at 4, as this bench has always used.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(forge_core::MAX_BLOCKING_THREADS)
+        .enable_all()
+        .build()
+        .expect("bench runtime")
+        .block_on(fan_out_body());
+}
+
+async fn fan_out_body() {
     const WORKERS: usize = 64;
     const CAP: usize = 16;
     const HYDRATE_CHUNK: usize = 10_000;

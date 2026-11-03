@@ -780,6 +780,9 @@ fn run_supervisor<F: WorkerFleet>(
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        // A current-thread runtime still ships tokio's 512-thread blocking pool, and
+        // every queue op is a `spawn_blocking` — see `forge_core::runtime`.
+        .max_blocking_threads(forge_core::MAX_BLOCKING_THREADS)
         .build()
     {
         Ok(rt) => rt,
