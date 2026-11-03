@@ -72,18 +72,27 @@ Source: routes in [`forge-agent/src/http.rs`](../forge-agent/src/http.rs) (`rout
 types in [`forge-proto/src/lib.rs`](../forge-proto/src/lib.rs). Served by
 `forge-agent serve`, spoken by `forge-agent run`'s `HttpCoordinator`.
 
-Every route is **`POST`, JSON in / JSON out**, and **unauthenticated** — the server
-binds loopback by default for exactly that reason. There are deliberately no
-task-graph types on this wire (no `depends_on`, no fan-in): it is a flat lease-proxy
-protocol.
+Every route is **`POST`, JSON in / JSON out**. There are deliberately no task-graph
+types on this wire (no `depends_on`, no fan-in): it is a flat lease-proxy protocol.
+
+**Authentication.** When the coordinator has a token (`FORGE_COORDINATOR_TOKEN` for
+`forge-agent serve`, `CoordinatorConfig::token` for an embedder), every route requires
+`Authorization: Bearer <token>`. It is checked in constant time **before** the body is
+read, and any failure is the same `401`. `forge-agent run` sends the same variable.
+Without a token the wire is open, so `forge-agent serve` refuses any non-loopback
+bind unless it is given `--insecure-no-auth`. The wire hands out raw prompts and
+accepts the results that become the record, so an open coordinator lets any host that
+can reach it read prompts or forge results.
 
 Common error responses (plain-text body):
 
 | code | when |
 |---|---|
 | `400` | unreadable or unparseable request body (`bad request body: …`) |
+| `401` | a token is configured and the request did not carry it (`WWW-Authenticate: Bearer`) |
 | `404` | unknown path (`no route for …`) |
 | `405` | non-POST method |
+| `413` | request body over 64 MiB |
 | `500` | queue/store error (message = the internal error) |
 
 ### `POST /v1/lease` — pull a lease batch
@@ -160,36 +169,78 @@ lease expiry regardless; a dropped notice changes nothing (`deadline` is optiona
 unmodified OpenAI-SDK code runs its batch flow against forge (verified end-to-end with
 the `openai` Python SDK: `batches.create` / `batches.retrieve` / `files.content`).
 Served by the `forge-batch` crate (`tiny_http`); every route except `/v1/health` needs
-`Authorization: Bearer <api-key>` when `--api-key` is set.
+`Authorization: Bearer <api-key>` when a key is set (`FORGE_API_KEY`, or `--api-key`).
 
 | method | path | body / params | returns |
 |---|---|---|---|
-| `GET` | `/v1/health` | — (no auth) | `{status:"ok", batches:N}` |
+| `GET` | `/v1/health` | — (no auth) | `{status:"ok", service, build:{version, git_sha, target}, uptime_secs}`. No batch count: that lives behind the key on `/metrics`. |
 | `GET` | `/metrics` | bearer | Prometheus text exposition (`text/plain; version=0.0.4`): `forge_batches{status}` / `forge_batch_items{state}` / `forge_files` gauges, plus monotonic `*_total` counters (batches created/completed/cancelled/failed, files uploaded, HTTP requests/errors) so `rate()` works. Behind the key, unlike `/v1/health`: it carries per-status batch and item counts, not just liveness. |
 | `POST` | `/v1/files` | raw JSONL body (`purpose=batch`) | File object `{id:"file-…", object:"file", bytes, created_at, filename, purpose}` |
+| `GET` | `/v1/files` | `?purpose=batch\|batch_output\|batch_error`, `?after=<file id>`, `?limit=<n>` (all optional) | `{object:"list", data:[File…], first_id, last_id, has_more}`, newest first. See *Lists*. |
 | `GET` | `/v1/files/{id}` | — | the File object |
 | `GET` | `/v1/files/{id}/content` | — | input file → bytes as-is; **output** file → one OpenAI batch-output line per result (see below) |
+| `DELETE` | `/v1/files/{id}` | — | `{id, object:"file", deleted:true}`. Removes the record **and** the bytes. Deleting a batch's output or error file also removes the raw results it was built from, and `/results` stops serving them even if a crash or a failed unlink leaves their bytes behind (the next startup removes those). **`409`** while the file is the input of an `in_progress` batch: a restart re-reads that input to resume the batch. Cancel it or let it finish first. |
 | `POST` | `/v1/batches` | `{input_file_id, endpoint, completion_window:"24h"}` | Batch object, `status:"in_progress"` — starts the fan-out across the server's fleet |
 | `GET` | `/v1/batches/{id}` | — | Batch object; `request_counts` + `status` read live from the queue; `output_file_id`/`error_file_id` set on completion |
-| `GET` | `/v1/batches` | — | `{object:"list", data:[Batch…]}` (newest-first, unpaginated) |
-| `POST` | `/v1/batches/{id}/cancel` | — | Batch object, `status:"cancelled"` |
+| `GET` | `/v1/batches` | `?after=<batch id>`, `?limit=<n>` (optional) | `{object:"list", data:[Batch…], first_id, last_id, has_more}`, newest first. See *Lists*. |
+| `POST` | `/v1/batches/{id}/cancel` | — | Batch object, `status:"cancelling"`. It turns `cancelled` once the run has stopped and its last results have landed, usually within a few hundred ms. A batch that is not `in_progress` is returned unchanged. |
+| `GET` | `/v1/batches/{id}/results` | `?kind=output\|error` (default `output`), `?after=<cursor>` | **forge extension**: the result lines written **so far**, mid-run, in the output-line shape below (`application/jsonl`, streamed). See *Reading results mid-run*. |
 
 **Batch object**: `{id:"batch-…", object:"batch", endpoint, input_file_id,
 completion_window, status, output_file_id, error_file_id, created_at, in_progress_at,
-completed_at, request_counts:{total, completed, failed}}`. `status` is `in_progress`
-until the queue drains, then `completed` (`request_counts` comes straight from queue
-counts — never double-tracked).
+completed_at, cancelled_at, request_counts:{total, completed, failed}}`. `status` is
+`in_progress` until the queue drains, then `completed` (`request_counts` comes straight
+from queue counts — never double-tracked). A cancel goes `cancelling` → `cancelled`; a
+run that cannot proceed ends `failed`.
+
+**Lists.** `GET /v1/files` and `GET /v1/batches` page the way the OpenAI SDKs iterate
+them, so `for f in client.files.list()` ends. `?limit=` sets the page size (none: every
+item) and `?after=<id>` starts after that item; `has_more` says whether another page
+follows, and `last_id` is the `after` for it. An `after` naming no listed item is a
+`400` rather than an empty page, because that item may have been deleted since the
+previous page, and an empty page would end the iteration early without saying so.
 
 **Output line** (`/v1/files/{output_id}/content`): `{id:"batch_req_…", custom_id,
 response:{status_code, request_id, body}, error:null}` for a done item;
 `{…, response:null, error:{…}}` for a dead-lettered one. Same `custom_id` keying as the
 CLI results file — map by id, never position.
 
+**Reading results mid-run.** The OpenAI contract only exposes results through
+`output_file_id`, which is stamped when the batch **completes**. On a large batch that
+means nothing is readable until the last item lands. `GET /v1/batches/{id}/results` is a
+forge extension that serves every complete line already written:
+
+- Each response carries **`x-forge-next-after`**. Pass it back as `?after=` to receive
+  only lines written since, so a client tails a batch without re-downloading it. The
+  results file only ever grows, so a cursor stays valid for the batch's lifetime. A
+  value the route did not hand out (one that is not on a line boundary, or is past the
+  end) is a `400`.
+- **`x-forge-batch-status`** is the batch status read *before* the snapshot. **Stop when
+  it is terminal (`completed`, `cancelled` or `failed`) and a call returns no lines.**
+  At that point you have every result. `cancelling` is not terminal: the run may still
+  be writing.
+- One response covers at most **16 MiB** of results. Past that, keep calling with the
+  new cursor, as for a running batch.
+- Only whole lines are served. The snapshot ends at the last newline, so a result being
+  written at that moment is never cut in half.
+- Line `id`s (`batch_req_…`) are minted per read. Join on `custom_id`.
+- It works in **every** status. A `cancelled` or `failed` batch never gets an
+  `output_file_id`, so this is the only route to the results it did finish.
+
+```sh
+cursor=0
+while :; do
+  curl -sS -D h.txt -H "Authorization: Bearer $FORGE_API_KEY" \
+    "http://localhost:8080/v1/batches/$BATCH/results?after=$cursor" >> partial.jsonl
+  cursor=$(awk 'tolower($1)=="x-forge-next-after:"{print $2}' h.txt | tr -d '\r')
+  # …stop once x-forge-batch-status is completed/cancelled/failed and nothing new came back
+  sleep 5
+done
+```
+
 **Honest MVP limits** (see the `forge-batch` rustdoc): `POST /v1/files` takes the raw
 JSONL body, **not** multipart — the SDK's `files.create` (multipart) needs a raw POST
-shim; every other SDK call is native. The `cancelling` transient is elided (→ straight
-to `cancelled`). Output content is buffered while reshaping (input files stream). No
-list pagination / `metadata`. A `serve-batch` **restart re-lists batches** from disk,
+shim; every other SDK call is native. No `metadata`. A `serve-batch` **restart re-lists batches** from disk,
 re-finalizes any that drained while it was down, **and restarts the fan-out for any left
 in flight** — the hydrate, the queue and the store are all idempotent, so a resumed batch
 completes every item exactly once. SIGTERM (not just Ctrl-C) shuts the server down

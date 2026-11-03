@@ -408,7 +408,9 @@ struct ServeBatchArgs {
     data_dir: PathBuf,
     /// Optional bearer token. When set, every route except `/v1/health` requires
     /// `Authorization: Bearer <token>`; when unset the server is open (trusted network).
-    #[arg(long)]
+    /// Prefer the FORGE_API_KEY environment variable: a flag value is visible to anyone
+    /// who can list processes on the host. An empty value is refused.
+    #[arg(long, env = "FORGE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     /// Number of HTTP accept threads sharing the listener.
     #[arg(long, default_value_t = 2)]
@@ -853,10 +855,25 @@ async fn cmd_serve_batch(a: ServeBatchArgs) -> anyhow::Result<()> {
         .workers
         .worker_specs(a.workers.concurrency.unwrap_or(DEFAULT_CONCURRENCY))?;
     let fleet = HttpFleet::new(specs, a.workers.retry_policy(), a.workers.require.into());
+    // A blank key would accept `Bearer ` with nothing after it: refuse it rather than
+    // start a server its operator believes is locked.
+    let api_key = a
+        .api_key
+        .as_deref()
+        .map(|k| forge_core::auth::non_blank_secret("--api-key / FORGE_API_KEY", k))
+        .transpose()?;
+    if api_key.is_none() && !forge_core::auth::is_loopback_bind(&a.listen) {
+        tracing::warn!(
+            listen = %a.listen,
+            "serving the Batch API with NO key on a non-loopback address: anyone who can \
+             reach it can upload, run and read batches. Set FORGE_API_KEY unless the \
+             network in front of it already authenticates every caller."
+        );
+    }
     let cfg = BatchConfig {
         bind: a.listen.clone(),
         data_dir: a.data_dir,
-        api_key: a.api_key,
+        api_key,
         fleet,
         run_config: a.workers.run_config(),
         threads: a.threads,

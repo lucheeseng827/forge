@@ -22,12 +22,15 @@
 //! |---|---|---|---|
 //! | `GET`  | `/v1/health` | liveness + batch count | none |
 //! | `POST` | `/v1/files` | upload a batch input JSONL → File object | bearer |
+//! | `GET`  | `/v1/files` | list File objects (`?purpose=` filter), newest first | bearer |
 //! | `GET`  | `/v1/files/{id}` | retrieve a File object | bearer |
+//! | `DELETE` | `/v1/files/{id}` | delete a file's record and bytes (409 while it is an in-progress batch's input) | bearer |
 //! | `GET`  | `/v1/files/{id}/content` | stream file bytes (output files reshaped to OpenAI batch-output lines) | bearer |
 //! | `POST` | `/v1/batches` | create + start a batch | bearer |
 //! | `GET`  | `/v1/batches` | list all batches (`{object:"list",data:[...]}`) | bearer |
 //! | `GET`  | `/v1/batches/{id}` | retrieve a batch (status mapped from queue counts) | bearer |
 //! | `POST` | `/v1/batches/{id}/cancel` | cancel a batch | bearer |
+//! | `GET`  | `/v1/batches/{id}/results` | **forge extension:** the results written so far, mid-run, with a resumable cursor | bearer |
 //!
 //! Bearer auth is enforced on everything except `/v1/health` **iff** an `api_key` was
 //! configured; with no key the server is open (fine for a trusted network / a sidecar).
@@ -43,7 +46,7 @@
 //! drained, it is finalized to `completed` on read.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
+use std::io::{BufRead, Read, Seek, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,7 +62,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod openai;
 pub use openai::{
-    BatchObject, CreateBatchRequest, FileObject, ListEnvelope, OutputLine, RequestCounts,
+    BatchObject, CreateBatchRequest, FileDeleted, FileObject, ListEnvelope, OutputLine,
+    RequestCounts,
 };
 
 // Lifecycle status strings (the OpenAI Batch `status` values we use).
@@ -80,6 +84,11 @@ pub(crate) fn rand_hex(bytes: usize) -> String {
     }
     s
 }
+
+/// The raw success-results file a batch's [`JsonlStore`] appends to, inside the batch dir.
+const RAW_OUTPUT: &str = "out.jsonl";
+/// The store's dead-letter sibling of [`RAW_OUTPUT`] (`JsonlStore` derives it by suffix).
+const RAW_ERROR: &str = "out.jsonl.dead.jsonl";
 
 /// Cap on a `POST /v1/files` upload body — generous for a large batch input JSONL.
 const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -282,6 +291,14 @@ struct BatchRecord {
     cancelled_at: Option<i64>,
     output_file_id: Option<String>,
     error_file_id: Option<String>,
+    /// Set when the batch's output (or error) file is deleted, before anything else
+    /// about the delete is written. `/v1/batches/{id}/results` reads the raw results
+    /// directly, so this, not the file registry, is what stops it serving them if a
+    /// crash or a failed unlink leaves their bytes behind. Startup removes such bytes.
+    #[serde(default)]
+    output_deleted: bool,
+    #[serde(default)]
+    error_deleted: bool,
 }
 
 /// The persisted truth for one file (`<data-dir>/files.json` maps `id` → this).
@@ -341,10 +358,10 @@ impl BatchEntry {
         self.dir.join("ckpt.db")
     }
     fn out_path(&self) -> PathBuf {
-        self.dir.join("out.jsonl")
+        self.dir.join(RAW_OUTPUT)
     }
     fn dead_path(&self) -> PathBuf {
-        self.dir.join("out.jsonl.dead.jsonl")
+        self.dir.join(RAW_ERROR)
     }
     /// The reshaped, OpenAI-batch-output-shaped, immutable sibling of [`Self::out_path`]
     /// — written once at finalize time by [`reshape_results_once`].
@@ -478,6 +495,10 @@ impl<F: WorkerFleet> ServerState<F> {
             }
         }
 
+        for entry in registry.batches.values() {
+            remove_deleted_results(entry);
+        }
+
         Ok(Self {
             metrics: Metrics::default(),
             bind: cfg.bind,
@@ -496,15 +517,18 @@ impl<F: WorkerFleet> ServerState<F> {
     }
 
     /// Persist the whole file registry (called under the registry lock after a change).
-    fn persist_files(&self, files: &HashMap<String, FileRecord>) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(files) {
-            if let Err(e) = write_atomic(&self.files_json(), &bytes) {
-                // Worth shouting about: this file is the ONLY record of which uploaded
-                // bytes belong to which file id. Losing it strands every batch that
-                // references one.
-                tracing::error!(error = %e, "could not persist the file registry");
-            }
-        }
+    ///
+    /// The error is logged here and also returned, for the one caller that must not
+    /// proceed on a failure: a delete unlinks bytes only once the registry on disk has
+    /// stopped naming them.
+    fn persist_files(&self, files: &HashMap<String, FileRecord>) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(files).map_err(std::io::Error::other)?;
+        write_atomic(&self.files_json(), &bytes).inspect_err(|e| {
+            // Worth shouting about: this file is the ONLY record of which uploaded
+            // bytes belong to which file id. Losing it strands every batch that
+            // references one.
+            tracing::error!(error = %e, "could not persist the file registry");
+        })
     }
 }
 
@@ -536,9 +560,39 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Atomic for the same reason as the file registry: this is what a restart re-lists a
 /// batch from, and a half-written record is a batch the server can no longer describe.
 fn persist_batch(dir: &Path, record: &BatchRecord) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(record) {
-        if let Err(e) = write_atomic(&dir.join("batch.json"), &bytes) {
-            tracing::error!(batch = %record.id, error = %e, "could not persist batch record");
+    if let Err(e) = try_persist_batch(dir, record) {
+        tracing::error!(batch = %record.id, error = %e, "could not persist batch record");
+    }
+}
+
+fn try_persist_batch(dir: &Path, record: &BatchRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+    write_atomic(&dir.join("batch.json"), &bytes)
+}
+
+/// Remove the bytes of whichever results a batch's record says were deleted: the raw
+/// stream `/results` reads and the reshaped file it was minted as. Run after a delete
+/// and again at startup, so bytes a crash or a failed unlink left behind do not outlive
+/// the next restart.
+fn remove_deleted_results(entry: &BatchEntry) {
+    let mut doomed = Vec::new();
+    if entry.record.output_deleted {
+        doomed.extend([entry.out_path(), entry.output_reshaped_path()]);
+    }
+    if entry.record.error_deleted {
+        doomed.extend([entry.dead_path(), entry.error_reshaped_path()]);
+    }
+    for path in doomed {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                batch = %entry.record.id,
+                path = %path.display(),
+                error = %e,
+                "deleted results could not be removed; the API no longer serves them, \
+                 and the next startup tries again"
+            ),
         }
     }
 }
@@ -590,7 +644,7 @@ fn finalize_completed<F: WorkerFleet>(state: &ServerState<F>, id: &str) {
     let output_file_id =
         mint_result_file(&mut reg.files, &output_reshaped_path, id, FileKind::Output);
     let error_file_id = mint_result_file(&mut reg.files, &error_reshaped_path, id, FileKind::Error);
-    state.persist_files(&reg.files);
+    let _ = state.persist_files(&reg.files);
 
     let entry = reg.batches.get_mut(id).unwrap();
     entry.record.status = S_COMPLETED.to_string();
@@ -619,6 +673,32 @@ fn finalize_failed<F: WorkerFleet>(state: &ServerState<F>, id: &str) {
     persist_batch(&entry.dir, &entry.record);
 }
 
+/// Move a `cancelling` batch to `cancelled`, once nothing of its run can still write.
+///
+/// The order matters to `/v1/batches/{id}/results`, the only way to read a cancelled
+/// batch's results. Its readers stop once the status is terminal and a read comes back
+/// empty. Results landing after `cancelled` had been reported were therefore lost to
+/// them, and the run used to go on writing for a while after the cancel. The supervisor
+/// calls this only after its runtime has been dropped, which waits for the writes in
+/// flight. A no-op for any other status, so a cancel that loses the race to a batch
+/// finishing on its own changes nothing.
+fn finalize_cancelled<F: WorkerFleet>(state: &ServerState<F>, id: &str) {
+    let mut reg = state.registry.lock().unwrap();
+    let Some(entry) = reg.batches.get_mut(id) else {
+        return;
+    };
+    if entry.record.status != S_CANCELLING {
+        return;
+    }
+    entry.record.status = S_CANCELLED.to_string();
+    state
+        .metrics
+        .batches_cancelled
+        .fetch_add(1, Ordering::Relaxed);
+    entry.record.cancelled_at = Some(now_ms());
+    persist_batch(&entry.dir, &entry.record);
+}
+
 /// Reshape a raw forge results file (`out.jsonl` / its `.dead.jsonl` sibling) into the
 /// OpenAI batch-output line shape **once**, writing the result to `dst`. Doing this at
 /// finalize time — rather than on every `GET /v1/files/{id}/content` — is what makes the
@@ -626,25 +706,87 @@ fn finalize_failed<F: WorkerFleet>(state: &ServerState<F>, id: &str) {
 /// `id` (and, absent an upstream one, a fresh `request_id`) on every call, so reshaping
 /// on each read made two successive GETs of the "same" file disagree with each other.
 /// Returns the byte length written, or `None` if `src` doesn't exist / reshapes to nothing.
+///
+/// **Streams, line by line.** This used to read the whole results file into one
+/// `String` and build the reshaped copy in a second one, so finalizing a batch held its
+/// entire output in memory twice — at the scale forge exists for, that is the batch's
+/// size in RAM, at the moment the batch finishes. Memory is now bounded by the longest
+/// single result line.
 fn reshape_results_once(src: &Path, dst: &Path) -> Option<u64> {
-    let content = std::fs::read_to_string(src).ok()?;
-    let mut out = String::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
+    let input = std::fs::File::open(src).ok()?;
+    let mut reader = ReshapeReader::new(std::io::BufReader::new(input));
+    let written = std::fs::File::create(dst).and_then(|f| {
+        let mut out = std::io::BufWriter::new(f);
+        let n = std::io::copy(&mut reader, &mut out)?;
+        out.flush()?;
+        Ok(n)
+    });
+    match written {
+        Ok(n) if n > 0 => Some(n),
+        Ok(_) => {
+            let _ = std::fs::remove_file(dst);
+            None
         }
-        if let Some(reshaped) = openai::reshape_result_line(line) {
-            if let Ok(s) = serde_json::to_string(&reshaped) {
-                out.push_str(&s);
-                out.push('\n');
+        Err(e) => {
+            // A half-written dst must not be minted as the batch's output file. The raw
+            // results are untouched, and stay readable through `/results`.
+            tracing::error!(src = %src.display(), error = %e, "could not reshape results");
+            let _ = std::fs::remove_file(dst);
+            None
+        }
+    }
+}
+
+/// Reads a raw forge results file and yields it as OpenAI batch-output lines, one
+/// line at a time, so memory is bounded by the longest line rather than the file.
+///
+/// Blank lines, and lines [`openai::reshape_result_line`] cannot use (a crash-torn
+/// fragment with no `custom_id`), are skipped, matching how the store's own scans
+/// treat them.
+struct ReshapeReader<R> {
+    src: R,
+    line: Vec<u8>,
+    out: Vec<u8>,
+    pos: usize,
+}
+
+impl<R: BufRead> ReshapeReader<R> {
+    fn new(src: R) -> Self {
+        Self {
+            src,
+            line: Vec::new(),
+            out: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl<R: BufRead> Read for ReshapeReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.out.len() {
+            self.out.clear();
+            self.pos = 0;
+            self.line.clear();
+            if self.src.read_until(b'\n', &mut self.line)? == 0 {
+                return Ok(0);
+            }
+            let Ok(text) = std::str::from_utf8(&self.line) else {
+                continue; // not a result the store could have written
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(reshaped) = openai::reshape_result_line(text) {
+                serde_json::to_writer(&mut self.out, &reshaped).map_err(std::io::Error::other)?;
+                self.out.push(b'\n');
             }
         }
+        let n = (self.out.len() - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.out[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
     }
-    if out.is_empty() {
-        return None;
-    }
-    std::fs::write(dst, out.as_bytes()).ok()?;
-    Some(out.len() as u64)
 }
 
 /// Register a File resource backing an already-reshaped, immutable results file.
@@ -696,8 +838,23 @@ fn mint_result_file(
 /// automatically, because nobody is awake to type it.
 ///
 /// A batch whose input file is no longer in the registry cannot be resumed; it is
-/// failed with a reason rather than left claiming progress it will never make.
+/// failed with a reason rather than left claiming progress it will never make. A batch
+/// left `cancelling` is finished as `cancelled`.
 fn resume_in_flight<F: WorkerFleet>(state: &Arc<ServerState<F>>) {
+    // A batch the previous process was cancelling has nothing left running it, so its
+    // cancel is complete: without this it would report `cancelling` forever.
+    let cancelling: Vec<String> = {
+        let reg = state.registry.lock().unwrap();
+        reg.batches
+            .values()
+            .filter(|e| e.record.status == S_CANCELLING)
+            .map(|e| e.record.id.clone())
+            .collect()
+    };
+    for id in cancelling {
+        finalize_cancelled(state, &id);
+    }
+
     // Collect first, then spawn: holding the registry lock across a thread spawn that
     // itself wants the lock is a deadlock waiting to be discovered at 3am.
     let pending: Vec<(String, PathBuf, Option<PathBuf>, Arc<AtomicBool>)> = {
@@ -789,6 +946,7 @@ fn run_supervisor<F: WorkerFleet>(
         Err(e) => {
             tracing::error!(batch = %id, error = %e, "could not build batch runtime");
             finalize_failed(&state, &id);
+            finalize_cancelled(&state, &id);
             return;
         }
     };
@@ -800,6 +958,9 @@ fn run_supervisor<F: WorkerFleet>(
             r = run_batch_inner(&state, &dir, &input_path) => Some(r),
         }
     });
+    // Dropping the runtime waits for the blocking writes the run had in flight. Only
+    // then may the status say the batch is over: see `finalize_cancelled`.
+    drop(rt);
 
     match outcome {
         Some(Ok(())) => finalize_completed(&state, &id),
@@ -807,10 +968,13 @@ fn run_supervisor<F: WorkerFleet>(
             tracing::warn!(batch = %id, error = %e, "batch run failed");
             finalize_failed(&state, &id);
         }
-        // Cancelled: the cancel handler already set the terminal state; do nothing (and
-        // `finalize_*` would no-op anyway, since the status is no longer `in_progress`).
-        None => tracing::info!(batch = %id, "batch run cancelled"),
+        // A cancel, or a shutdown, which flips the same flag but leaves the batch
+        // `in_progress` so the next process resumes it.
+        None => tracing::info!(batch = %id, "batch run stopped"),
     }
+    // A cancel that arrived at any point ends here, whatever the run did meanwhile (the
+    // finalizers above leave a `cancelling` batch alone).
+    finalize_cancelled(&state, &id);
 }
 
 /// Poll the cancel flag; resolve once it flips. The 100ms granularity bounds how long
@@ -844,7 +1008,7 @@ async fn run_batch_inner<F: WorkerFleet>(
     }
 
     let workers = state.fleet.build()?;
-    let store = JsonlStore::new(dir.join("out.jsonl"));
+    let store = JsonlStore::new(dir.join(RAW_OUTPUT));
     BatchRun::new(queue, workers, store)
         .with_config(state.run_config)
         .run()
@@ -900,7 +1064,7 @@ fn handle_request<F: WorkerFleet>(
     // it behind the key is a two-line scrape config.
     if let Some(expected) = &state.api_key {
         let auth = header_value(req.headers(), "authorization");
-        if !bearer_matches(auth.as_deref(), expected) {
+        if !forge_core::auth::bearer_matches(auth.as_deref(), expected) {
             state.metrics.http_errors.fetch_add(1, Ordering::Relaxed);
             return respond_unauthorized(req);
         }
@@ -914,6 +1078,16 @@ fn handle_request<F: WorkerFleet>(
     // Files.
     if *m == tiny_http::Method::Post && path == "/v1/files" {
         return upload_file(req, state);
+    }
+    if *m == tiny_http::Method::Get && path == "/v1/files" {
+        return list_files(req, state);
+    }
+    if *m == tiny_http::Method::Delete {
+        if let Some(id) = path.strip_prefix("/v1/files/") {
+            if !id.is_empty() && !id.contains('/') {
+                return delete_file(req, state, id);
+            }
+        }
     }
     if *m == tiny_http::Method::Get {
         if let Some(id) = path
@@ -938,6 +1112,10 @@ fn handle_request<F: WorkerFleet>(
         if let Some(id) = rest.strip_suffix("/cancel") {
             if *m == tiny_http::Method::Post {
                 return cancel_batch(rt, req, state, id);
+            }
+        } else if let Some(id) = rest.strip_suffix("/results") {
+            if *m == tiny_http::Method::Get {
+                return batch_results(req, state, id);
             }
         } else if *m == tiny_http::Method::Get && !rest.is_empty() {
             return get_batch(rt, req, state, rest);
@@ -982,7 +1160,7 @@ fn upload_file<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerSt
         let mut reg = state.registry.lock().unwrap();
         reg.files.insert(id, record);
         state.metrics.files_uploaded.fetch_add(1, Ordering::Relaxed);
-        state.persist_files(&reg.files);
+        let _ = state.persist_files(&reg.files);
     }
     respond_json(req, 200, serde_json::to_string(&object).unwrap_or_default());
 }
@@ -996,6 +1174,203 @@ fn file_object<F: WorkerFleet>(req: tiny_http::Request, state: &Arc<ServerState<
             serde_json::to_string(&f.to_object()).unwrap_or_default(),
         ),
         None => respond_text(req, 404, "no such file"),
+    }
+}
+
+/// `GET /v1/files` — the retained files, newest first, optionally narrowed by
+/// `?purpose=` (`batch` / `batch_output` / `batch_error`) and paged by `?after=` /
+/// `?limit=` (see [`list_page`]), in the OpenAI list envelope.
+fn list_files<F: WorkerFleet>(req: tiny_http::Request, state: &Arc<ServerState<F>>) {
+    let purpose = query_param(req.url(), "purpose");
+    let mut data: Vec<FileObject> = {
+        let reg = state.registry.lock().unwrap();
+        reg.files
+            .values()
+            .filter(|f| purpose.as_deref().map_or(true, |p| f.purpose == p))
+            .map(FileRecord::to_object)
+            .collect()
+    };
+    // Newest first, with the id as a tiebreak so two uploads in the same millisecond
+    // list in the same order on every call.
+    data.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    match list_page(req.url(), data, |f| f.id.as_str()) {
+        Ok(page) => respond_json(req, 200, serde_json::to_string(&page).unwrap_or_default()),
+        Err(msg) => respond_text(req, 400, &msg),
+    }
+}
+
+/// The page of a listing that `?after=` and `?limit=` select, in the envelope the
+/// OpenAI SDKs page through. Their auto-pagination asks again with `?after=<last_id>`
+/// until `has_more` is false; an envelope without `has_more`, from a server that also
+/// ignored `after`, made `for f in client.files.list()` run forever.
+///
+/// No `limit` means every remaining item, so a plain `GET` lists everything, as it did
+/// before paging. An `after` that names no item in the listing is refused rather than
+/// guessed at. The item may have been deleted since the previous page, and an empty
+/// page would end the caller's iteration early without saying so.
+fn list_page<T>(
+    raw_url: &str,
+    items: Vec<T>,
+    id: impl Fn(&T) -> &str,
+) -> Result<ListEnvelope<T>, String> {
+    let limit = match query_param(raw_url, "limit") {
+        None => usize::MAX,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => return Err(format!("`limit` must be a positive integer, not {v:?}")),
+        },
+    };
+    let start = match query_param(raw_url, "after") {
+        None => 0,
+        Some(after) => match items.iter().position(|t| id(t) == after) {
+            Some(i) => i + 1,
+            None => {
+                return Err(format!(
+                    "`after` {after:?} is not in this listing (deleted since the last \
+                     page?); list again without it"
+                ))
+            }
+        },
+    };
+    let mut page: Vec<T> = items.into_iter().skip(start).collect();
+    let has_more = page.len() > limit;
+    page.truncate(limit);
+    Ok(ListEnvelope::page(page, has_more, id))
+}
+
+/// Set (or clear) the tombstone of the batch whose output or error file `file_id` is,
+/// and persist it; a no-op for an input file. On a failed write the record is left as
+/// it was, and the delete must not go ahead.
+fn mark_results_deleted(
+    reg: &mut Registry,
+    file_id: &str,
+    kind: FileKind,
+    deleted: bool,
+) -> std::io::Result<()> {
+    let batch = reg.batches.values_mut().find(|b| match kind {
+        FileKind::Output => b.record.output_file_id.as_deref() == Some(file_id),
+        FileKind::Error => b.record.error_file_id.as_deref() == Some(file_id),
+        FileKind::Input => false,
+    });
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+    let flag = match kind {
+        FileKind::Error => &mut batch.record.error_deleted,
+        _ => &mut batch.record.output_deleted,
+    };
+    let was = std::mem::replace(flag, deleted);
+    try_persist_batch(&batch.dir, &batch.record).inspect_err(|_| match kind {
+        FileKind::Error => batch.record.error_deleted = was,
+        _ => batch.record.output_deleted = was,
+    })
+}
+
+/// `DELETE /v1/files/{id}` — forget a file and remove its bytes.
+///
+/// **Refused (409) while the file is the input of an in-progress batch.** The batch
+/// already hydrated from it, so the running fan-out would not notice. The next restart
+/// would, though: resuming an in-flight batch re-reads its input, and finding the file
+/// gone, it fails a batch that was going to finish. Cancel or finish the batch first.
+///
+/// The order is tombstone, registry, bytes. Deleting a batch's output or error file
+/// first marks its results deleted on the batch record ([`mark_results_deleted`]),
+/// because `/results` serves the raw results without looking at the registry. Then the
+/// registry, then the bytes. A crash or a failed unlink after the tombstone leaves bytes
+/// that nothing serves, and startup removes them. The other order could leave a record
+/// pointing at bytes that no longer exist, a lie the API would keep telling. If the
+/// tombstone or the registry cannot be written, the delete is undone and nothing is
+/// unlinked.
+fn delete_file<F: WorkerFleet>(req: tiny_http::Request, state: &Arc<ServerState<F>>, id: &str) {
+    enum Outcome {
+        Missing,
+        InUse(String),
+        NotPersisted(std::io::Error),
+        Deleted(FileRecord),
+    }
+    let outcome = {
+        let mut reg = state.registry.lock().unwrap();
+        match reg.files.get(id).map(|f| f.kind) {
+            None => Outcome::Missing,
+            Some(kind) => {
+                let busy = (kind == FileKind::Input)
+                    .then(|| {
+                        reg.batches
+                            .values()
+                            .find(|b| {
+                                b.record.input_file_id == id && b.record.status == S_IN_PROGRESS
+                            })
+                            .map(|b| b.record.id.clone())
+                    })
+                    .flatten();
+                match busy {
+                    Some(batch) => Outcome::InUse(batch),
+                    None => match mark_results_deleted(&mut reg, id, kind, true) {
+                        Err(e) => Outcome::NotPersisted(e),
+                        Ok(()) => {
+                            let record = reg.files.remove(id).expect("checked present above");
+                            match state.persist_files(&reg.files) {
+                                Ok(()) => Outcome::Deleted(record),
+                                Err(e) => {
+                                    reg.files.insert(id.to_string(), record);
+                                    // The file is still listed, so its results are too.
+                                    let _ = mark_results_deleted(&mut reg, id, kind, false);
+                                    Outcome::NotPersisted(e)
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    };
+
+    match outcome {
+        Outcome::Missing => respond_text(req, 404, "no such file"),
+        Outcome::InUse(batch) => respond_text(
+            req,
+            409,
+            &format!(
+                "file {id} is the input of batch {batch}, which is still in progress. Cancel \
+                 the batch or let it finish, then delete the file."
+            ),
+        ),
+        Outcome::NotPersisted(e) => respond_internal(req, "persisting a file deletion", e),
+        Outcome::Deleted(record) => {
+            // A batch's output or error file was reshaped from the raw results its store
+            // wrote, and `/results` serves those raw lines directly. Deleting the file
+            // removes them too, so "delete my results" leaves no copy behind that the
+            // API would keep handing out. (Only a finished batch has an output file, so
+            // no run is still appending to them.)
+            let raw = record.path.parent().and_then(|dir| match record.kind {
+                FileKind::Input => None,
+                FileKind::Output => Some(dir.join(RAW_OUTPUT)),
+                FileKind::Error => Some(dir.join(RAW_ERROR)),
+            });
+            for path in std::iter::once(&record.path).chain(raw.as_ref()) {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        file = %record.id,
+                        path = %path.display(),
+                        error = %e,
+                        "file deleted from the registry but these bytes could not be \
+                         removed; nothing references them any more"
+                    ),
+                }
+            }
+            let body = FileDeleted {
+                id: record.id,
+                object: "file".to_string(),
+                deleted: true,
+            };
+            respond_json(req, 200, serde_json::to_string(&body).unwrap_or_default());
+        }
     }
 }
 
@@ -1040,21 +1415,6 @@ fn create_batch<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerS
         Err(e) => return respond_text(req, 400, &format!("bad request body: {e}")),
     };
 
-    // Resolve the referenced input file.
-    let input_path = {
-        let reg = state.registry.lock().unwrap();
-        match reg.files.get(&request.input_file_id) {
-            Some(f) => f.path.clone(),
-            None => {
-                return respond_text(
-                    req,
-                    404,
-                    &format!("no such input_file_id: {}", request.input_file_id),
-                )
-            }
-        }
-    };
-
     let id = format!("batch-{}", rand_hex(12));
     let dir = state.data_dir.join("batches").join(&id);
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -1078,51 +1438,269 @@ fn create_batch<F: WorkerFleet>(mut req: tiny_http::Request, state: &Arc<ServerS
         cancelled_at: None,
         output_file_id: None,
         error_file_id: None,
+        output_deleted: false,
+        error_deleted: false,
     };
     persist_batch(&dir, &record);
 
+    // Resolve the input file and register the batch in ONE hold of the lock. That is
+    // what makes `DELETE /v1/files/{id}` refuse this batch's input: it looks for an
+    // in-progress batch naming the file, and a batch registered in a second hold would
+    // leave it a window to delete the file the run was about to hydrate from.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let input_path = {
+        let mut reg = state.registry.lock().unwrap();
+        match reg.files.get(&request.input_file_id) {
+            Some(f) => {
+                let input_path = f.path.clone();
+                reg.batches.insert(
+                    id.clone(),
+                    BatchEntry {
+                        record: record.clone(),
+                        dir: dir.clone(),
+                        cancel: Arc::clone(&cancel),
+                        task: None,
+                        read_queue: None,
+                    },
+                );
+                Some(input_path)
+            }
+            None => None,
+        }
+    };
+    let Some(input_path) = input_path else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return respond_text(
+            req,
+            404,
+            &format!("no such input_file_id: {}", request.input_file_id),
+        );
+    };
+
     // Spawn the fan-out on its own OS thread + current-thread runtime (see
     // `run_supervisor` for why not `tokio::spawn`). The cancel flag is the stop handle.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let task = {
+    let spawned = {
         let state = Arc::clone(state);
         let id = id.clone();
         let dir = dir.clone();
-        let cancel = Arc::clone(&cancel);
-        match std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(format!("forge-batch-{id}"))
             .spawn(move || run_supervisor(state, id, dir, input_path, cancel))
-        {
-            Ok(t) => Some(t),
-            Err(e) => {
-                // No supervisor means nothing will ever hydrate the queue or run the
-                // fan-out — reporting `in_progress` here would strand the batch forever
-                // with no way for the caller to detect it. Fail the request instead of
-                // persisting an unrunnable batch.
-                return respond_internal(req, "spawning a batch supervisor", e);
+    };
+    match spawned {
+        Ok(t) => {
+            let mut reg = state.registry.lock().unwrap();
+            if let Some(e) = reg.batches.get_mut(&id) {
+                e.task = Some(t);
             }
         }
-    };
+        Err(e) => {
+            // No supervisor means nothing will ever hydrate the queue or run the
+            // fan-out — reporting `in_progress` here would strand the batch forever
+            // with no way for the caller to detect it. Fail the request, and forget the
+            // batch, on disk too, so a restart does not resume one the caller was told
+            // was never created.
+            state.registry.lock().unwrap().batches.remove(&id);
+            let _ = std::fs::remove_dir_all(&dir);
+            return respond_internal(req, "spawning a batch supervisor", e);
+        }
+    }
 
     let object = record_to_object(&record, RequestCounts::default());
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.batches.insert(
-            id,
-            BatchEntry {
-                record,
-                dir,
-                cancel,
-                task,
-                read_queue: None,
-            },
-        );
-    }
     state
         .metrics
         .batches_created
         .fetch_add(1, Ordering::Relaxed);
     respond_json(req, 200, serde_json::to_string(&object).unwrap_or_default());
+}
+
+/// `GET /v1/batches/{id}/results` — the results written so far, readable mid-run.
+///
+/// **A forge extension, not part of the OpenAI Batch API**, which only exposes results
+/// through `output_file_id` once a batch completes. On a large batch that means nothing
+/// is readable until the last item lands. This serves every complete line already
+/// written, reshaped exactly like the output file.
+///
+/// - `kind=output` (default) or `kind=error` picks the success or dead-letter stream.
+/// - `after=N` resumes from a cursor. Every response carries `x-forge-next-after`; pass
+///   it back to receive only lines written since, so a client can tail a batch without
+///   re-downloading it. The store only ever appends, so a cursor stays valid for the
+///   batch's lifetime. A value this route did not hand out is refused, not guessed at.
+/// - `x-forge-batch-status` is the status read **before** the snapshot. So "the status
+///   is terminal and this call returned no lines" means the client has everything.
+///
+/// Only complete lines are served: the snapshot ends at the last newline, so a result
+/// being appended at that moment is never cut in half. Line `id`s are minted per read,
+/// as with any reshape; `custom_id` is the join key.
+///
+/// One response covers at most [`RESULTS_WINDOW_BYTES`] of raw results, and the
+/// cursor carries the reader through the rest. That bounds the memory one call costs,
+/// whatever the batch's size. tiny_http buffers the whole body of a response with no
+/// known length when the client cannot take it chunked (HTTP/1.0, `TE: identity`), and
+/// a reshaped stream's length is not known up front.
+fn batch_results<F: WorkerFleet>(req: tiny_http::Request, state: &Arc<ServerState<F>>, id: &str) {
+    let (dir, status, output_deleted, error_deleted) = {
+        let reg = state.registry.lock().unwrap();
+        match reg.batches.get(id) {
+            Some(e) => (
+                e.dir.clone(),
+                e.record.status.clone(),
+                e.record.output_deleted,
+                e.record.error_deleted,
+            ),
+            None => return respond_text(req, 404, "no such batch"),
+        }
+    };
+    let raw_url = req.url().to_string();
+    // `None`: deleted with the batch's output or error file, so served as never
+    // written, whatever bytes a failed unlink may have left on disk.
+    let path = match query_param(&raw_url, "kind").as_deref() {
+        None | Some("output") => (!output_deleted).then(|| dir.join(RAW_OUTPUT)),
+        Some("error") => (!error_deleted).then(|| dir.join(RAW_ERROR)),
+        Some(other) => {
+            return respond_text(
+                req,
+                400,
+                &format!("unknown kind {other:?}: expected `output` or `error`"),
+            )
+        }
+    };
+    let after = match query_param(&raw_url, "after").map(|v| v.parse::<u64>()) {
+        None => 0,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => {
+            return respond_text(
+                req,
+                400,
+                "`after` must be a byte cursor, as returned in x-forge-next-after",
+            )
+        }
+    };
+
+    let window = match &path {
+        Some(path) => results_window(path, after, RESULTS_WINDOW_BYTES),
+        None if after == 0 => Ok(None),
+        None => Err(CursorError::Invalid(format!(
+            "`after` {after} is past the end of these results, which were deleted"
+        ))),
+    };
+    let (body, next): (Box<dyn Read + Send>, u64) = match window {
+        Ok(Some((mut file, end))) => {
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(after)) {
+                return respond_internal(req, "reading batch results", e);
+            }
+            let lines = std::io::BufReader::new(file.take(end - after));
+            (Box::new(ReshapeReader::new(lines)), end)
+        }
+        Ok(None) => (Box::new(std::io::empty()), after),
+        Err(CursorError::Invalid(msg)) => return respond_text(req, 400, &msg),
+        Err(CursorError::Io(e)) => return respond_internal(req, "reading batch results", e),
+    };
+
+    let mut headers = vec![
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/jsonl"[..])
+            .expect("static header"),
+        tiny_http::Header::from_bytes(&b"x-forge-next-after"[..], next.to_string().as_bytes())
+            .expect("digits are a valid header value"),
+        tiny_http::Header::from_bytes(&b"x-forge-batch-status"[..], status.as_bytes())
+            .expect("a status is a fixed lowercase word"),
+    ];
+    headers.extend(request_id_header());
+    // No length: the body is reshaped as it streams, so its size is not known up front
+    // (tiny_http sends it chunked).
+    let _ = req.respond(tiny_http::Response::new(
+        tiny_http::StatusCode(200),
+        headers,
+        body,
+        None,
+        None,
+    ));
+}
+
+/// Most raw result bytes one `/v1/batches/{id}/results` response covers (see
+/// [`batch_results`]); a line longer than this is still served whole, on its own.
+const RESULTS_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+
+enum CursorError {
+    /// The cursor is not one this route could have handed out.
+    Invalid(String),
+    Io(std::io::Error),
+}
+
+/// The byte range `[after, end)` of a raw results file that holds only complete lines,
+/// `end` being one past the last newline within `max` bytes of `after`, in the file as
+/// it is right now. If one line is longer than `max`, the range runs to that line's
+/// end instead, so the cursor always moves while there is a complete line to read.
+/// `Ok(None)` when there is nothing to read yet: the file does not exist, or no line
+/// has been finished since `after`.
+///
+/// `after` must be 0 or sit just past a newline, which is the only kind of value
+/// `x-forge-next-after` ever carries. Anything else would start mid-record.
+fn results_window(
+    path: &Path,
+    after: u64,
+    max: u64,
+) -> Result<Option<(std::fs::File, u64)>, CursorError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && after == 0 => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CursorError::Invalid(format!(
+                "`after` {after} is past the end of these results, which are empty \
+                 (never written, or deleted with the batch's output file)"
+            )))
+        }
+        Err(e) => return Err(CursorError::Io(e)),
+    };
+    let len = file.metadata().map_err(CursorError::Io)?.len();
+    if after > len {
+        return Err(CursorError::Invalid(format!(
+            "`after` {after} is past the end of these results ({len} bytes)"
+        )));
+    }
+    let mut byte = [0u8; 1];
+    if after > 0 {
+        file.seek(std::io::SeekFrom::Start(after - 1))
+            .and_then(|_| file.read_exact(&mut byte))
+            .map_err(CursorError::Io)?;
+        if byte[0] != b'\n' {
+            return Err(CursorError::Invalid(format!(
+                "`after` {after} does not fall on a line boundary; pass back a value from \
+                 x-forge-next-after"
+            )));
+        }
+    }
+
+    // Walk back from the window's end to the last newline. Records are rarely longer
+    // than a few KiB, so this almost always reads a single chunk.
+    let cap = len.min(after.saturating_add(max));
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut hi = cap;
+    while hi > after {
+        let lo = hi.saturating_sub(chunk.len() as u64).max(after);
+        let n = (hi - lo) as usize;
+        file.seek(std::io::SeekFrom::Start(lo))
+            .and_then(|_| file.read_exact(&mut chunk[..n]))
+            .map_err(CursorError::Io)?;
+        if let Some(i) = chunk[..n].iter().rposition(|&b| b == b'\n') {
+            return Ok(Some((file, lo + i as u64 + 1)));
+        }
+        hi = lo;
+    }
+    // No newline in the window: one line longer than `max` starts at `after`. Serve it
+    // whole once it is complete, rather than never moving the cursor past it.
+    let mut lo = cap;
+    while lo < len {
+        let n = ((len - lo) as usize).min(chunk.len());
+        file.seek(std::io::SeekFrom::Start(lo))
+            .and_then(|_| file.read_exact(&mut chunk[..n]))
+            .map_err(CursorError::Io)?;
+        if let Some(i) = chunk[..n].iter().position(|&b| b == b'\n') {
+            return Ok(Some((file, lo + i as u64 + 1)));
+        }
+        lo += n as u64;
+    }
+    Ok(None)
 }
 
 /// `GET /metrics` — Prometheus text exposition.
@@ -1368,10 +1946,16 @@ fn list_batches<F: WorkerFleet>(
             data.push(record_to_object(&e.record, rc));
         }
     }
-    // Newest first (a friendly default; OpenAI paginates, which the MVP does not).
-    data.sort_by_key(|b| std::cmp::Reverse(b.created_at));
-    let env = ListEnvelope::new(data);
-    respond_json(req, 200, serde_json::to_string(&env).unwrap_or_default());
+    // Newest first, with the id as a tiebreak so pages split the same way on every call.
+    data.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    match list_page(req.url(), data, |b| b.id.as_str()) {
+        Ok(page) => respond_json(req, 200, serde_json::to_string(&page).unwrap_or_default()),
+        Err(msg) => respond_text(req, 400, &msg),
+    }
 }
 
 fn cancel_batch<F: WorkerFleet>(
@@ -1385,25 +1969,20 @@ fn cancel_batch<F: WorkerFleet>(
         let Some(entry) = reg.batches.get_mut(id) else {
             return respond_text(req, 404, "no such batch");
         };
-        // Already terminal → return it unchanged (can't cancel a finished batch).
+        // Anything but in progress → returned unchanged (a finished batch cannot be
+        // cancelled, and a cancelling one is already on its way).
         if entry.record.status == S_IN_PROGRESS {
             // Flip the cooperative cancel flag; the supervisor drops the run future within
             // ~100ms. We can't cleanly drain BatchRun mid-flight (it owns its loop), so we
             // stop it: results already written stay; in-flight leased items are simply not
-            // retried (their leases expire in the ckpt.db). We transition straight to
-            // `cancelled` — the brief `cancelling` state is elided because the flag flip is
-            // synchronous from the server's view — and stop reporting further progress.
+            // retried (their leases expire in the ckpt.db). The batch is `cancelling` until
+            // the supervisor has stopped and its last writes have landed, then `cancelled`
+            // (see `finalize_cancelled`), as in the OpenAI Batch API.
             entry.cancel.store(true, Ordering::SeqCst);
-            entry.record.status = S_CANCELLED.to_string();
-            state
-                .metrics
-                .batches_cancelled
-                .fetch_add(1, Ordering::Relaxed);
-            entry.record.cancelled_at = Some(now_ms());
+            entry.record.status = S_CANCELLING.to_string();
             persist_batch(&entry.dir, &entry.record);
         }
     }
-    let _ = S_CANCELLING; // documented-but-elided intermediate state
 
     // Live counts, exactly like get_batch/list_batches — the cancelled batch's progress
     // at the moment of cancellation, not a hardcoded all-zero placeholder.
@@ -1426,26 +2005,6 @@ fn cancel_batch<F: WorkerFleet>(
 }
 
 // ───────────────────────────── http helpers ─────────────────────────────
-
-fn bearer_matches(auth: Option<&str>, expected: &str) -> bool {
-    auth.and_then(|a| a.strip_prefix("Bearer "))
-        .map(|t| constant_time_eq(t.trim().as_bytes(), expected.as_bytes()))
-        .unwrap_or(false)
-}
-
-/// Constant-time byte comparison — this guards the server's only auth boundary, so a
-/// length-and-short-circuit `==` would leak a timing side-channel on the API key. No new
-/// dependency: XOR-accumulate every byte (padding the shorter side) so the comparison
-/// always touches every byte of both inputs regardless of where they first differ.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_diff = (a.len() != b.len()) as u8;
-    let n = a.len().max(b.len());
-    let mut diff = len_diff;
-    for i in 0..n {
-        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
-    }
-    diff == 0
-}
 
 fn header_value(headers: &[tiny_http::Header], field: &str) -> Option<String> {
     headers
@@ -1526,21 +2085,113 @@ fn respond_unauthorized(req: tiny_http::Request) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bearer_match_logic() {
-        assert!(bearer_matches(Some("Bearer sk-123"), "sk-123"));
-        assert!(!bearer_matches(Some("Bearer sk-123"), "sk-999"));
-        assert!(!bearer_matches(Some("sk-123"), "sk-123")); // missing scheme
-        assert!(!bearer_matches(None, "sk-123"));
+    fn scratch(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("forge-batch-unit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]
-    fn constant_time_eq_matches_regular_equality() {
-        assert!(constant_time_eq(b"sk-123", b"sk-123"));
-        assert!(!constant_time_eq(b"sk-123", b"sk-999"));
-        assert!(!constant_time_eq(b"short", b"much-longer"));
-        assert!(!constant_time_eq(b"", b"x"));
-        assert!(constant_time_eq(b"", b""));
+    fn reshape_reader_streams_whole_lines_and_skips_blank_and_torn_ones() {
+        let raw = concat!(
+            r#"{"custom_id":"a","response":{"status_code":200,"body":{"ok":1}}}"#,
+            "\n\n",
+            "{\"custom_id\":\"tor",
+            "\n",
+            r#"{"custom_id":"b","error":{"code":"x","message":"m"}}"#,
+            "\n",
+        );
+        let mut reader = ReshapeReader::new(raw.as_bytes());
+        // A tiny buffer, so a reshaped line has to be handed out across several reads.
+        let mut out = Vec::new();
+        let mut buf = [0u8; 7];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        let lines: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the blank line and the torn fragment are skipped"
+        );
+        assert_eq!(lines[0]["custom_id"], "a");
+        assert_eq!(lines[0]["response"]["body"]["ok"], 1);
+        assert_eq!(lines[1]["custom_id"], "b");
+        assert!(lines[1]["response"].is_null());
+        assert_eq!(lines[1]["error"]["code"], "x");
+    }
+
+    #[test]
+    fn reshaping_nothing_usable_mints_no_file() {
+        let d = scratch("reshape-empty");
+        let src = d.join("out.jsonl");
+        let dst = d.join("output.reshaped.jsonl");
+        std::fs::write(&src, "\n{\"torn").unwrap();
+        assert_eq!(reshape_results_once(&src, &dst), None);
+        assert!(!dst.exists(), "an empty reshape leaves no file to mint");
+        assert_eq!(reshape_results_once(&d.join("absent.jsonl"), &dst), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_results_window_ends_at_the_last_newline_and_only_accepts_real_cursors() {
+        let d = scratch("window");
+        let p = d.join("out.jsonl");
+        let end = |after| results_window(&p, after, 1 << 20).map(|w| w.map(|(_, end)| end));
+
+        // No file yet: nothing to read from the start, and any later cursor is bogus.
+        assert!(matches!(end(0), Ok(None)));
+        assert!(matches!(end(5), Err(CursorError::Invalid(_))));
+
+        // Two complete lines and one still being written: the window stops at byte 6.
+        std::fs::write(&p, "L1\nL2\npart").unwrap();
+        assert!(matches!(end(0), Ok(Some(6))));
+        assert!(matches!(end(3), Ok(Some(6))));
+        assert!(
+            matches!(end(6), Ok(None)),
+            "nothing completed since the cursor"
+        );
+        assert!(matches!(end(1), Err(CursorError::Invalid(_))), "mid-line");
+        assert!(
+            matches!(end(11), Err(CursorError::Invalid(_))),
+            "past the end"
+        );
+
+        // The writer finishes its line: the same cursor now yields it.
+        std::fs::write(&p, "L1\nL2\npartial\n").unwrap();
+        assert!(matches!(end(6), Ok(Some(14))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_results_window_is_capped_but_always_moves_the_cursor() {
+        let d = scratch("window-cap");
+        let p = d.join("out.jsonl");
+        let end = |after, max| results_window(&p, after, max).map(|w| w.map(|(_, end)| end));
+
+        // Lines end at 3, 6, 9 and 21. A 7-byte window from 0 ends at the last newline
+        // inside it; the cursor then walks the file a window at a time.
+        std::fs::write(&p, "L1\nL2\nL3\nlonger-line\nend").unwrap();
+        assert!(matches!(end(0, 7), Ok(Some(6))));
+        assert!(matches!(end(6, 7), Ok(Some(9))));
+        // A line longer than the window is served whole, on its own.
+        assert!(matches!(end(9, 7), Ok(Some(21))));
+        assert!(matches!(end(9, 1), Ok(Some(21))));
+        // A long line still being written is not served yet, however small the window.
+        assert!(matches!(end(21, 1), Ok(None)));
+        // A window past the end of the file changes nothing.
+        assert!(matches!(end(0, u64::MAX), Ok(Some(21))));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

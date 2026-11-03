@@ -6,6 +6,148 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-28
+
+forge's two servers become safe to bind beyond loopback, and the OpenAI front door
+does what SDK code expects, including mid-run. One breaking change, below, with its
+migration.
+
+### Breaking
+
+- **`forge-agent serve` refuses a non-loopback `--bind` without a token.** Set
+  `FORGE_COORDINATOR_TOKEN` on the coordinator and on every `forge-agent run`. To keep
+  the old open behaviour on a network where every host that can reach the port is
+  already trusted, pass `--insecure-no-auth` instead. Loopback binds, the default, are
+  unchanged. The refusal happens before the queue is opened, so it leaves no state
+  file behind. A 0.2 agent sends no token, so it cannot lease from a tokened
+  coordinator: keep agents and coordinator on the same minor, as before.
+
+### Added
+
+- **The coordinator wire is authenticated.** It hands out raw prompts and accepts the
+  results that become the record, and until now anyone who could reach it could do
+  both. With a token, every route requires `Authorization: Bearer <token>`, checked in
+  constant time **before** the body is read. Missing, wrong-scheme and wrong-token
+  requests all get the same `401`. Request bodies are capped at 64 MiB; they used to
+  be read unbounded. The agent's error on a `401` names the variable to set and says
+  whether it sent no token or a wrong one, rather than reporting a bare status.
+  Library: `serve_coordinator_with` + `CoordinatorConfig` (whose `Debug` redacts the
+  token) and `HttpCoordinator::with_token`. `serve_coordinator` keeps its signature
+  and stays open.
+- **`GET /v1/files` and `DELETE /v1/files/{id}` on `serve-batch`.** `client.files.list()`
+  and `client.files.delete()` are the first cleanup calls existing SDK code makes, and
+  both answered `404 no such route`. A delete answers the SDK's `FileDeleted` shape and
+  removes the bytes as well as the record. It is refused with `409` while the file is
+  the input of an in-progress batch, because a restart re-reads that input to resume
+  the batch and would otherwise fail a batch that was going to finish. The registry is
+  written before the bytes are removed, so a crash in between leaves an orphan file
+  rather than a record pointing at nothing. Deleting a batch's output or error file
+  also removes the raw results it was built from, so no copy is left for the API to
+  keep serving. A tombstone on the batch is written first, so a crash or a failed
+  unlink cannot leave those results readable through `/results`; startup removes any
+  bytes left behind. The list pages the way the SDKs iterate it: `has_more`, `first_id` and
+  `last_id`, with `?after=` and `?limit=` honoured. A plain `GET` still lists
+  everything, and an `after` naming no listed file is a `400`, never a silently short
+  page.
+- **Mid-run results: `GET /v1/batches/{id}/results`.** The OpenAI contract only exposes
+  results through `output_file_id`, stamped when a batch completes, so on a large batch
+  nothing was readable until the last item landed. This forge extension serves every
+  complete line written so far, in the same output-line shape. `x-forge-next-after` is
+  a cursor: pass it back as `?after=` to tail a batch without re-downloading it.
+  `x-forge-batch-status` tells a client when it has everything (terminal status, empty
+  read). The snapshot ends at the last newline, so a result being written at that
+  moment is never cut in half. A cursor the route did not hand out is refused rather
+  than read from mid-record. It also serves **cancelled and failed** batches. Neither
+  ever gets an `output_file_id`, so until now the results they did finish had no
+  route at all. One response covers at most 16 MiB of results, and the cursor carries
+  a reader through the rest, so what one call costs the server is bounded whatever the
+  batch's size and whatever the client's HTTP version.
+- **`serve-batch` reads its key from `FORGE_API_KEY`.** `--api-key` still works, but a
+  flag value sits in `/proc/<pid>/cmdline`, where anything that can list processes on
+  the host can read it. `--help` never prints the value. An open server on a
+  non-loopback `--listen` now logs a warning at startup. `make serve-batch` takes the
+  key from `FORGE_API_KEY` in its environment too, and refuses `API_KEY=` on its
+  command line, where the key would sit in make's own process listing.
+- `forge_core::auth`: the constant-time bearer check, loopback test and blank-secret
+  rule, shared by both servers instead of being written once per server.
+
+### Changed
+
+- **A cancelled batch is `cancelling` until its run has stopped, then `cancelled`**,
+  as in the OpenAI Batch API. It used to report `cancelled` at once while the run went
+  on writing for up to about 100 ms, plus whatever writes it had in flight. A client
+  tailing `/v1/batches/{id}/results` until "terminal and empty" could stop before
+  those results landed and lose them. For a cancelled batch, that route is the only
+  way to its results. `cancelled_at` is now when the batch stopped. A process that dies
+  mid-cancel finishes the cancel on restart.
+- **The Helm chart hands `serve-batch` its key as `FORGE_API_KEY`**, which keeps it out
+  of the container's process list. Images from v0.3.0 on read that variable. An older
+  `image.tag`, or one the chart cannot read as a version, gets `--api-key` as well:
+  such an image ignores the variable and would start with no key, and
+  `helm upgrade --reuse-values` keeps an old release's tag. `serveBatch.apiKeyArg`
+  (`auto`, `always`, `never`) overrides that choice. The chart version and its default
+  image, both still 0.1.2 through the 0.2 releases, move to 0.3.0.
+
+### Security
+
+- **One unauthenticated request could abort `serve-batch` or the coordinator.** Both
+  serve HTTP through tiny_http 0.12.0, the latest release, which discarded the unread
+  part of a request body with an allocation the size of the client's *declared*
+  `Content-Length`. Any request that was rejected unread (a `401`, a `413`, a route
+  that ignores its body) and declared more than RAM + swap made the process abort.
+  Reproduced against `serve-batch`: a wrong-key request declaring 4 EiB got its `401`,
+  then the process died with SIGABRT. The same code had two more faults:
+  - A client that declared a body and never sent it held one of the server's accept
+    threads until it disconnected, so a handful of them froze the server.
+  - An unread **chunked** body was not discarded at all. Its bytes were parsed as the
+    next request on the connection, so whoever wrote the body chose what the server
+    answered next.
+
+  Review of the patched copy found more faults reachable without credentials, all
+  fixed:
+  - **A client that reset its connection right after sending a request aborted the
+    release binary.** The HTTP layer `unwrap()`ped a peer address it could no longer
+    read, and forge's release build is `panic = "abort"`.
+  - **A request line naming HTTP/2.0** deadlocked its own `505`, leaking a thread and
+    two file descriptors per request until the server ran out.
+  - **Running out of file descriptors or threads ended the server**, and enough idle
+    connections cause that. An `accept()` error stopped it accepting for good, with
+    the process still up. A connection accepted with the last free descriptor, or one
+    the OS refused a thread for, panicked the accept thread, which aborted the release
+    binary.
+  - **A chunk-size line was buffered without limit**, past the handlers' body caps.
+  - **A chunked body cut short by a disconnect** was taken as complete.
+
+  forge now builds against a patched copy in `vendor/tiny_http`, wired in by
+  `[patch.crates-io]`. An unread body is never drained: the connection is closed after
+  the response instead. A body cut short by a disconnect, chunked or not, is a read
+  error rather than a complete short body. Request, header and chunk-size lines are
+  capped (16 KiB, 16 KiB and 1 KiB), and requests at 128 headers. A keep-alive client whose body the handler did not read now gets its
+  connection closed after the response; one whose body was read keeps it.
+  `vendor/tiny_http/FORGE_PATCHES.md` lists every change. The regression tests in
+  `forge-cli/tests/hostile_http.rs` and `forge-agent/tests/cli.rs` run the real
+  binaries, and every one of them fails against unpatched 0.12.0. Still not addressed:
+  the HTTP layer has no read timeouts, so put a reverse proxy with timeouts in front of
+  any port an untrusted network can reach.
+
+### Fixed
+
+- **Finalizing a batch held its entire output in memory, twice.** The reshape into the
+  OpenAI output shape read the whole results file into one `String` and built the copy
+  in another, at the moment a batch finishes, which at forge's scale is the batch's
+  size in RAM. It now streams line by line, bounded by the longest single result. A
+  reshape that fails part-way no longer leaves a truncated file to be minted as the
+  batch's output.
+- **`client.batches.list()` never ended.** `GET /v1/batches` sent no `has_more`, so
+  the OpenAI SDKs' auto-pagination kept asking for the next page, and got the whole
+  list again every time. It now pages like `GET /v1/files`, newest first, with the id
+  as a tiebreak so pages split the same way on every call.
+- **A blank `serve-batch` key is a startup error.** An empty `--api-key` used to start
+  a server whose only valid credential was an empty bearer token. Nobody configures
+  that on purpose, and a templating slip (`FORGE_API_KEY=""`) would produce it
+  silently. The same rule applies to the new coordinator token. Surrounding whitespace,
+  such as the trailing newline a secret picks up in a Kubernetes Secret, is trimmed.
+
 ## [0.2.1] — 2026-10-27
 
 Everything here merged **after** the v0.2.0 tag was cut on 2026-09-10 and is therefore
@@ -443,7 +585,8 @@ interruptions, and prove completeness — as a single static binary.
   OpenAI SDK code runs its batch flow against your own endpoints, with real
   per-item progress and mid-run partial results.
 
-[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/forge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lucheeseng827/forge/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lucheeseng827/forge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lucheeseng827/forge/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/lucheeseng827/forge/compare/v0.1.1...v0.1.2

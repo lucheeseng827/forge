@@ -18,6 +18,7 @@
 // `async fn` desugaring is fine; silence the forward-compat lint deliberately.
 #![allow(async_fn_in_trait)]
 
+pub mod auth;
 pub mod build;
 mod cost;
 mod error;

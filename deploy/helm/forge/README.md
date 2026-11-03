@@ -15,7 +15,7 @@ Two shapes, independently toggleable:
 
 ```sh
 # from the OCI registry (no checkout needed):
-helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.1.2 \
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.3.0 \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
   --set 'serveBatch.apiKey=<key>'
 
@@ -28,13 +28,14 @@ helm install forge deploy/helm/forge \
 
 The default image is the official multi-arch `docker.io/mancube/forge`
 (linux/amd64 + linux/arm64, ~5 MB, FROM scratch). Building your own instead:
-`docker build -t <registry>/forge:v0.1.1 .` from the repo root, push it, and
-set `image.repository`.
+`docker build -t <registry>/forge:v0.3.0 .` from the repo root, push it, and
+set `image.repository` (and `image.tag` if yours differs).
 
 Then any OpenAI SDK pointed at `http://<service>:8080/v1` runs its batch flow
 (`files.create` → `batches.create` → poll → `files.content`) against your own
-engines, with live per-item progress. (Results become fetchable when the batch
-finalizes; the OpenAI file contract has no mid-run partial fetch.)
+engines, with live per-item progress. The OpenAI file contract only has results
+once the batch finalizes; forge's `GET /v1/batches/{id}/results` serves them mid-run
+(see `docs/API.md`).
 
 ## One-shot batch as a Job
 
@@ -60,6 +61,13 @@ eviction or node loss continue from the checkpoint instead of starting over.
 - No API key = every route open. Fine inside a trusted namespace; set
   `serveBatch.apiKey` before exposing the Service anywhere else, and put TLS
   in front (Ingress/mesh) — forge itself is plain HTTP.
+- The key reaches serve-batch as `FORGE_API_KEY`, which images from v0.3.0 on
+  read. For an older `image.tag`, or one the chart cannot read as a version
+  (a custom build, `latest`), it is passed as `--api-key` too. That puts it in
+  the container's process list, but such an image would otherwise ignore the
+  variable and serve with no key. That matters on `helm upgrade --reuse-values`
+  from an older release, which keeps that release's image tag. For a custom
+  build of v0.3.0 or later, set `serveBatch.apiKeyArg=never`.
 - Spot/preemptible node pools: schedule the *engines* there, keep the
   coordinator (tiny, stateful) on stable capacity; lease-expiry re-queues
   whatever a killed engine node was holding.

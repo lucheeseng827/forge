@@ -43,16 +43,21 @@ forge-agent run --coordinator http://coordinator:8080 --engine http://localhost:
                 --worker-id gpu1 --concurrency 64 --endpoint chat --cloud aws
 
 # the coordinator side: expose a hydrated queue + result store over forge-proto HTTP
-forge-agent serve --queue ckpt.db --out out.jsonl --bind 127.0.0.1:8080
+export FORGE_COORDINATOR_TOKEN="$(openssl rand -hex 32)"   # same value on every agent
+forge-agent serve --queue ckpt.db --out out.jsonl --bind 0.0.0.0:8080
 ```
 
-The library `serve_coordinator` fn stays generic over the `forge-core` traits; the
-`serve` subcommand wires a real `forge_queue::SqliteQueue` + `forge_store::JsonlStore`.
-Note that `serve` is unauthenticated — it defaults to loopback; widen the bind only
-behind your own network controls.
+The library fns stay generic over the `forge-core` traits: `serve_coordinator_with`
+takes a `CoordinatorConfig` (lease default, threads, and an optional token), and
+`HttpCoordinator::with_token` sends it. The plain `serve_coordinator` is the open
+form. The `serve` subcommand wires a real `forge_queue::SqliteQueue` +
+`forge_store::JsonlStore` and reads `FORGE_COORDINATOR_TOKEN`. It refuses a
+non-loopback bind without the token unless given `--insecure-no-auth`, because an
+open coordinator lets any host that can reach it read prompts or forge results.
 
 ## Config
 
 | Env | Purpose |
 |-----|---------|
 | `RUST_LOG` | `tracing` subscriber filter (default `info`) |
+| `FORGE_COORDINATOR_TOKEN` | Shared coordinator token: required by `serve` on every route, sent by `run`. Env-only (never a flag), and a blank value is a startup error. |

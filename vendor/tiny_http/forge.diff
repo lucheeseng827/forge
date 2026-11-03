@@ -1,0 +1,900 @@
+diff -ruN a/src/client.rs b/src/client.rs
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -6,12 +6,21 @@
+ 
+ use std::net::SocketAddr;
+ use std::str::FromStr;
++use std::sync::mpsc::Receiver;
+ 
+ use crate::common::{HTTPVersion, Method};
+ use crate::util::RefinedTcpStream;
+ use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
+ use crate::Request;
+ 
++/// FORGE PATCH (#2): longest request line or header line accepted, in bytes. Upstream
++/// buffered a line until its CRLF arrived however long it was, so one endless header
++/// grew memory for as long as the client kept sending.
++const MAX_LINE_BYTES: usize = 16 * 1024;
++
++/// FORGE PATCH (#2): most header lines accepted on one request.
++const MAX_HEADERS: usize = 128;
++
+ /// A ClientConnection is an object that will store a socket to a client
+ /// and return Request objects.
+ pub struct ClientConnection {
+@@ -32,6 +41,10 @@
+     // set to true if we know that the previous request is the last one
+     no_more_requests: bool,
+ 
++    // FORGE PATCH (#1): whether the previous request's body was read to its end; the next
++    // request is only parsed once it was (see `util::BodyReader`).
++    previous_body: Option<Receiver<bool>>,
++
+     // true if the connection goes through SSL
+     secure: bool,
+ }
+@@ -64,6 +77,7 @@
+             remote_addr,
+             next_header_source: first_header,
+             no_more_requests: false,
++            previous_body: None,
+             secure,
+         }
+     }
+@@ -97,6 +111,11 @@
+ 
+             prev_byte_was_cr = byte == b'\r';
+ 
++            // FORGE PATCH (#2): `buf` may also hold the line's CR, hence `>`.
++            if buf.len() > MAX_LINE_BYTES {
++                return Err(IoError::new(ErrorKind::InvalidData, "line too long"));
++            }
++
+             buf.push(byte);
+         }
+     }
+@@ -107,7 +126,11 @@
+         let (method, path, version, headers) = {
+             // reading the request line
+             let (method, path, version) = {
+-                let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
++                // FORGE PATCH (#2): an over-long request line is a 400, not a buffer.
++                let line = self.read_next_line().map_err(|e| match e.kind() {
++                    ErrorKind::InvalidData => ReadError::WrongRequestLine,
++                    _ => ReadError::ReadIoError(e),
++                })?;
+ 
+                 parse_request_line(
+                     line.as_str().trim(), // TODO: remove this conversion
+@@ -118,11 +141,19 @@
+             let headers = {
+                 let mut headers = Vec::new();
+                 loop {
+-                    let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
++                    // FORGE PATCH (#2): over-long header lines and too many headers are a
++                    // 400, not unbounded buffering.
++                    let line = self.read_next_line().map_err(|e| match e.kind() {
++                        ErrorKind::InvalidData => ReadError::WrongHeader(version.clone()),
++                        _ => ReadError::ReadIoError(e),
++                    })?;
+ 
+                     if line.is_empty() {
+                         break;
+                     };
++                    if headers.len() >= MAX_HEADERS {
++                        return Err(ReadError::WrongHeader(version));
++                    }
+                     headers.push(match FromStr::from_str(line.as_str().trim()) {
+                         // TODO: remove this conversion
+                         Ok(h) => h,
+@@ -144,13 +175,14 @@
+         std::mem::swap(&mut self.next_header_source, &mut data_source);
+ 
+         // building the next reader
+-        let request = crate::request::new_request(
++        let mut request = crate::request::new_request(
+             self.secure,
+             method,
+             path,
+             version.clone(),
+             headers,
+-            *self.remote_addr.as_ref().unwrap(),
++            // FORGE PATCH (#4): upstream unwrapped this; `next` refuses the error case.
++            self.remote_addr.as_ref().ok().and_then(|addr| *addr),
+             data_source,
+             writer,
+         )
+@@ -164,6 +196,9 @@
+             }
+         })?;
+ 
++        // FORGE PATCH (#1)
++        self.previous_body = request.take_body_consumed();
++
+         // return the request
+         Ok(request)
+     }
+@@ -183,7 +218,24 @@
+             return None;
+         }
+ 
++        // FORGE PATCH (#4): a peer that reset the connection before its address could be
++        // read is gone. Upstream still parsed the request it had sent, then panicked
++        // unwrapping the missing address, and a `panic = "abort"` build died with it.
++        if self.remote_addr.is_err() {
++            return None;
++        }
++
+         loop {
++            // FORGE PATCH (#1): the socket holds the previous request's body until it has
++            // been read, so nothing after it may be parsed as a request until we know it
++            // was. A body that was not read to its end closes the connection: what is
++            // left on the wire is unknown, and reading it as a request is smuggling.
++            if let Some(consumed) = self.previous_body.take() {
++                if consumed.recv() != Ok(true) {
++                    return None;
++                }
++            }
++
+             let rq = match self.read() {
+                 Err(ReadError::WrongRequestLine) => {
+                     let writer = self.sink.next().unwrap();
+@@ -227,7 +279,10 @@
+ 
+             // checking HTTP version
+             if *rq.http_version() > (1, 1) {
+-                let writer = self.sink.next().unwrap();
++                // FORGE PATCH (#5): answered on the request's own writer, then closed.
++                // Upstream took a fresh writer, which waits for the one `rq` still held,
++                // so every such request stuck a thread and its connection for good.
++                let writer = rq.into_writer();
+                 let response = Response::from_string(
+                     "This server only supports HTTP versions 1.0 and 1.1".to_owned(),
+                 )
+@@ -235,7 +290,7 @@
+                 response
+                     .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
+                     .ok();
+-                continue;
++                return None;
+             }
+ 
+             // updating the status of the connection
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -294,7 +294,8 @@
+                 let new_client = match server.accept() {
+                     Ok((sock, _)) => {
+                         use util::RefinedTcpStream;
+-                        let (read_closable, write_closable) = match ssl {
++                        // FORGE PATCH (#6): `RefinedTcpStream::new` is fallible.
++                        let streams = match ssl {
+                             None => RefinedTcpStream::new(sock),
+                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+                             Some(ref ssl) => {
+@@ -311,7 +312,9 @@
+                             Some(ref _ssl) => unreachable!(),
+                         };
+ 
+-                        Ok(ClientConnection::new(write_closable, read_closable))
++                        streams.map(|(read_closable, write_closable)| {
++                            ClientConnection::new(write_closable, read_closable)
++                        })
+                     }
+                     Err(e) => Err(e),
+                 };
+@@ -339,9 +342,15 @@
+                     }
+ 
+                     Err(e) => {
++                        // FORGE PATCH (#6): an accept error is not the end of the server.
++                        // Upstream handed it to `recv` and stopped accepting for good, so
++                        // running out of file descriptors for a moment (idle connections
++                        // are enough) left a live process that never took another
++                        // connection. Back off so that condition does not spin, and keep
++                        // accepting; only the close trigger ends this loop.
+                         log::error!("Error accepting new client: {}", e);
+-                        inside_messages.push(e.into());
+-                        break;
++                        thread::sleep(Duration::from_millis(100));
++                        continue;
+                     }
+                 }
+             }
+diff -ruN a/src/request.rs b/src/request.rs
+--- a/src/request.rs
++++ b/src/request.rs
+@@ -5,11 +5,10 @@
+ use std::net::SocketAddr;
+ use std::str::FromStr;
+ 
+-use std::sync::mpsc::Sender;
++use std::sync::mpsc::{Receiver, Sender};
+ 
+-use crate::util::{EqualReader, FusedReader};
++use crate::util::{BodyReader, ChunkedDecoder, EqualReader, FusedReader};
+ use crate::{HTTPVersion, Header, Method, Response, StatusCode};
+-use chunked_transfer::Decoder;
+ 
+ /// Represents an HTTP request made by a client.
+ ///
+@@ -74,6 +73,11 @@
+ 
+     // If Some, a message must be sent after responding
+     notify_when_responded: Option<Sender<()>>,
++
++    // FORGE PATCH (#1): for a body still being read off the connection, says whether it
++    // was read to its end. Taken by the connection, which must not parse another request
++    // from the socket until it knows.
++    body_consumed: Option<Receiver<bool>>,
+ }
+ 
+ struct NotifyOnDrop<R> {
+@@ -183,6 +187,10 @@
+         }
+     };
+ 
++    // FORGE PATCH (#1): set for the two body forms still on the wire (streamed
++    // length-delimited, and chunked); see `BodyReader`.
++    let mut body_consumed = None;
++
+     // we wrap `source_data` around a reading whose nature depends on the transfer-encoding and
+     // content-length headers
+     let reader = if connection_upgrade {
+@@ -212,13 +220,21 @@
+ 
+             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
+         } else {
+-            let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
+-            Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
++            // FORGE PATCH (#1): wrapped so the connection learns whether it was consumed.
++            let data_reader = EqualReader::new(source_data, content_length);
++            let (body, consumed) = BodyReader::new(FusedReader::new(data_reader));
++            body_consumed = Some(consumed);
++            Box::new(body) as Box<dyn Read + Send + 'static>
+         }
+     } else if transfer_encoding.is_some() {
+         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
+         // over the message (RFC2616 #3.6)
+-        Box::new(FusedReader::new(Decoder::new(source_data))) as Box<dyn Read + Send + 'static>
++        // FORGE PATCH (#1): upstream dropped an unread chunked body without discarding it,
++        // so its bytes were parsed as the next request on the connection.
++        // FORGE PATCH (#3): decoded by `ChunkedDecoder`, not `chunked_transfer::Decoder`.
++        let (body, consumed) = BodyReader::new(FusedReader::new(ChunkedDecoder::new(source_data)));
++        body_consumed = Some(consumed);
++        Box::new(body) as Box<dyn Read + Send + 'static>
+     } else {
+         // if we have neither a Content-Length nor a Transfer-Encoding,
+         // assuming that we have no data
+@@ -238,6 +254,7 @@
+         body_length: content_length,
+         must_send_continue: expects_continue,
+         notify_when_responded: None,
++        body_consumed,
+     })
+ }
+ 
+@@ -293,6 +310,12 @@
+         self.remote_addr.as_ref()
+     }
+ 
++    /// FORGE PATCH (#1): hands the connection the receiver that says whether this
++    /// request's body was read to its end (`None` when the body was not streamed).
++    pub(crate) fn take_body_consumed(&mut self) -> Option<Receiver<bool>> {
++        self.body_consumed.take()
++    }
++
+     /// Sends a response with a `Connection: upgrade` header, then turns the `Request` into a `Stream`.
+     ///
+     /// The main purpose of this function is to support websockets.
+diff -ruN a/src/util/body_reader.rs b/src/util/body_reader.rs
+--- a/src/util/body_reader.rs
++++ b/src/util/body_reader.rs
+@@ -0,0 +1,126 @@
++// FORGE PATCH (FORGE_PATCHES.md #1): this file is new; it is not part of upstream.
++
++use std::io::{ErrorKind, Read, Result as IoResult};
++use std::sync::mpsc::{channel, Receiver, Sender};
++
++/// Wraps a request body that is still being read off the connection, and reports,
++/// exactly once, whether it was read to its end.
++///
++/// The connection must not parse another request until it knows. Bytes of a body the
++/// handler did not read are still in the socket, and parsing them as the next request is
++/// request smuggling: whoever wrote the body chooses the "request" the server answers
++/// next. Upstream discarded the remainder of a length-delimited body when it was dropped
++/// (see `EqualReader`), which could abort the process or block a thread forever, and
++/// discarded nothing at all of a chunked one, which is the smuggling case.
++///
++/// Nothing is discarded here. A body read to its end lets the connection carry on; a
++/// body dropped early, or that failed to read, closes the connection after the response.
++pub struct BodyReader<R> {
++    inner: R,
++    consumed: Option<Sender<bool>>,
++}
++
++impl<R: Read> BodyReader<R> {
++    pub fn new(inner: R) -> (BodyReader<R>, Receiver<bool>) {
++        let (tx, rx) = channel();
++        (
++            BodyReader {
++                inner,
++                consumed: Some(tx),
++            },
++            rx,
++        )
++    }
++}
++
++impl<R> BodyReader<R> {
++    fn report(&mut self, consumed: bool) {
++        if let Some(tx) = self.consumed.take() {
++            // The connection may already be gone; then nobody needs the answer.
++            let _ = tx.send(consumed);
++        }
++    }
++}
++
++impl<R: Read> Read for BodyReader<R> {
++    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
++        if buf.is_empty() {
++            // A zero-length read returns 0 without meaning end-of-body.
++            return Ok(0);
++        }
++        match self.inner.read(buf) {
++            Ok(0) => {
++                // Reported as soon as it is known, so a pipelined next request can be
++                // read while the handler is still working on this one.
++                self.report(true);
++                Ok(0)
++            }
++            Ok(n) => Ok(n),
++            Err(e) if e.kind() == ErrorKind::Interrupted => Err(e),
++            Err(e) => {
++                self.report(false);
++                Err(e)
++            }
++        }
++    }
++}
++
++impl<R> Drop for BodyReader<R> {
++    fn drop(&mut self) {
++        // Dropped before its end: the rest is still on the wire.
++        self.report(false);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::BodyReader;
++    use std::io::{Cursor, Read};
++
++    #[test]
++    fn a_body_read_to_its_end_reports_consumed() {
++        let (mut body, consumed) = BodyReader::new(Cursor::new(b"hello".to_vec()));
++        let mut s = String::new();
++        body.read_to_string(&mut s).unwrap();
++        assert_eq!(s, "hello");
++        assert_eq!(
++            consumed.try_recv(),
++            Ok(true),
++            "known at EOF, before the drop"
++        );
++        drop(body);
++        assert!(consumed.try_recv().is_err(), "reported exactly once");
++    }
++
++    #[test]
++    fn a_body_dropped_early_reports_abandoned() {
++        let (mut body, consumed) = BodyReader::new(Cursor::new(b"hello".to_vec()));
++        let mut one = [0u8; 1];
++        body.read_exact(&mut one).unwrap();
++        drop(body);
++        assert_eq!(consumed.recv(), Ok(false));
++    }
++
++    #[test]
++    fn an_unread_body_reports_abandoned() {
++        let (body, consumed) = BodyReader::new(Cursor::new(b"hello".to_vec()));
++        drop(body);
++        assert_eq!(consumed.recv(), Ok(false));
++    }
++
++    #[test]
++    fn a_read_error_reports_abandoned() {
++        struct Broken;
++        impl Read for Broken {
++            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
++                Err(std::io::Error::new(
++                    std::io::ErrorKind::UnexpectedEof,
++                    "cut",
++                ))
++            }
++        }
++        let (mut body, consumed) = BodyReader::new(Broken);
++        assert!(body.read(&mut [0u8; 4]).is_err());
++        assert_eq!(consumed.try_recv(), Ok(false));
++    }
++}
+diff -ruN a/src/util/chunked_decoder.rs b/src/util/chunked_decoder.rs
+--- a/src/util/chunked_decoder.rs
++++ b/src/util/chunked_decoder.rs
+@@ -0,0 +1,225 @@
++// FORGE PATCH (FORGE_PATCHES.md #3): this file is new; it is not part of upstream.
++
++use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
++
++/// Longest chunk-size line accepted, extensions included and CRLF excluded, in bytes.
++const MAX_SIZE_LINE_BYTES: usize = 1024;
++
++/// Decodes a `Transfer-Encoding: chunked` request body.
++///
++/// It replaces `chunked_transfer::Decoder` on the request side, which had two defects:
++/// - It buffered a chunk-size line, extensions included, until its CR arrived, however
++///   long it was. A client could grow server memory for as long as it kept sending,
++///   inside a body whose decoded length the handler had capped.
++/// - When the connection ended inside a chunk it returned a plain EOF, so a handler
++///   that read to the end accepted a truncated body as complete.
++///
++/// Here the size line is bounded. A body that ends before its last chunk is an
++/// `UnexpectedEof` error, and a malformed one is `InvalidData`. As upstream, trailers
++/// are not accepted: the last chunk must be followed directly by CRLF.
++pub struct ChunkedDecoder<R> {
++    source: R,
++    state: State,
++}
++
++enum State {
++    /// Expecting a chunk-size line.
++    Size,
++    /// Inside a chunk, with this many data bytes still to read.
++    Data(usize),
++    /// The last chunk and its CRLF have been read.
++    Done,
++}
++
++impl<R: Read> ChunkedDecoder<R> {
++    pub fn new(source: R) -> ChunkedDecoder<R> {
++        ChunkedDecoder {
++            source,
++            state: State::Size,
++        }
++    }
++
++    fn next_byte(&mut self) -> IoResult<u8> {
++        let mut byte = [0u8; 1];
++        loop {
++            match self.source.read(&mut byte) {
++                Ok(0) => return Err(truncated()),
++                Ok(_) => return Ok(byte[0]),
++                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
++                Err(e) => return Err(e),
++            }
++        }
++    }
++
++    fn expect_crlf(&mut self) -> IoResult<()> {
++        if self.next_byte()? == b'\r' && self.next_byte()? == b'\n' {
++            Ok(())
++        } else {
++            Err(malformed("missing CRLF after a chunk"))
++        }
++    }
++
++    /// `chunk-size [ ";" extensions ] CRLF`; extensions are ignored, as upstream.
++    fn read_size_line(&mut self) -> IoResult<usize> {
++        let mut line = Vec::new();
++        loop {
++            let byte = self.next_byte()?;
++            if byte == b'\r' {
++                break;
++            }
++            if line.len() >= MAX_SIZE_LINE_BYTES {
++                return Err(malformed("chunk-size line too long"));
++            }
++            line.push(byte);
++        }
++        if self.next_byte()? != b'\n' {
++            return Err(malformed("chunk-size line not ended by CRLF"));
++        }
++        let size = line.split(|&b| b == b';').next().unwrap_or(&[]);
++        let size = std::str::from_utf8(size)
++            .map(|s| s.trim_matches(|c| c == ' ' || c == '\t'))
++            .unwrap_or("");
++        if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
++            return Err(malformed("invalid chunk size"));
++        }
++        usize::from_str_radix(size, 16).map_err(|_| malformed("chunk size out of range"))
++    }
++}
++
++impl<R: Read> Read for ChunkedDecoder<R> {
++    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
++        if buf.is_empty() {
++            return Ok(0);
++        }
++        loop {
++            match self.state {
++                State::Done => return Ok(0),
++                State::Size => {
++                    let size = self.read_size_line()?;
++                    if size == 0 {
++                        self.expect_crlf()?;
++                        self.state = State::Done;
++                        return Ok(0);
++                    }
++                    self.state = State::Data(size);
++                }
++                State::Data(left) => {
++                    let want = buf.len().min(left);
++                    let n = self.source.read(&mut buf[..want])?;
++                    if n == 0 {
++                        return Err(truncated());
++                    }
++                    if n == left {
++                        self.expect_crlf()?;
++                        self.state = State::Size;
++                    } else {
++                        self.state = State::Data(left - n);
++                    }
++                    return Ok(n);
++                }
++            }
++        }
++    }
++}
++
++fn truncated() -> IoError {
++    IoError::new(
++        ErrorKind::UnexpectedEof,
++        "connection closed inside a chunked body",
++    )
++}
++
++fn malformed(what: &'static str) -> IoError {
++    IoError::new(ErrorKind::InvalidData, what)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::ChunkedDecoder;
++    use std::io::{Cursor, ErrorKind, Read};
++
++    fn decode(wire: &[u8]) -> std::io::Result<Vec<u8>> {
++        let mut out = Vec::new();
++        ChunkedDecoder::new(wire).read_to_end(&mut out)?;
++        Ok(out)
++    }
++
++    #[test]
++    fn decodes_chunks_and_ignores_extensions() {
++        assert_eq!(
++            decode(b"3\r\nhel\r\nb\r\nlo world!!!\r\n0\r\n\r\n").unwrap(),
++            b"hello world!!!"
++        );
++        assert_eq!(decode(b"0\r\n\r\n").unwrap(), b"");
++        assert_eq!(
++            decode(b"1;ext name=value\r\na\r\nA \t; x;y\r\n0123456789\r\n0;z\r\n\r\n").unwrap(),
++            b"a0123456789"
++        );
++    }
++
++    #[test]
++    fn nothing_past_the_last_chunk_is_read() {
++        let mut wire = Cursor::new(b"2\r\nok\r\n0\r\n\r\nGET / HTTP/1.1\r\n".to_vec());
++        let mut out = Vec::new();
++        ChunkedDecoder::new(&mut wire)
++            .read_to_end(&mut out)
++            .unwrap();
++        assert_eq!(out, b"ok");
++        assert_eq!(wire.position(), 12, "the next request is left on the wire");
++    }
++
++    #[test]
++    fn a_body_cut_short_is_an_error_not_an_eof() {
++        for wire in [
++            &b"64\r\n0123456789012345678901234567890123456789"[..], // inside a chunk
++            b"3\r\nhel\r\n",                                        // before the last chunk
++            b"3\r\nhel",                                            // before a chunk's CRLF
++            b"3",                                                   // inside a size line
++            b"0\r\n",                                               // before the final CRLF
++        ] {
++            let err = decode(wire).unwrap_err();
++            assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "{:?}", wire);
++        }
++    }
++
++    #[test]
++    fn an_endless_size_line_is_refused_after_a_bounded_read() {
++        let mut wire = Cursor::new(vec![b'0'; 1 << 20]);
++        let err = ChunkedDecoder::new(&mut wire)
++            .read(&mut [0u8; 16])
++            .unwrap_err();
++        assert_eq!(err.kind(), ErrorKind::InvalidData);
++        assert!(wire.position() <= 1025, "read {} bytes", wire.position());
++
++        let mut ext = b"1;".to_vec();
++        ext.extend(vec![b'x'; 1 << 20]);
++        assert_eq!(decode(&ext).unwrap_err().kind(), ErrorKind::InvalidData);
++
++        let mut longest = vec![b'0'; 1023];
++        longest.extend_from_slice(b"1\r\nx\r\n0\r\n\r\n");
++        assert_eq!(
++            decode(&longest).unwrap(),
++            b"x",
++            "a 1 KiB size line is accepted"
++        );
++    }
++
++    #[test]
++    fn malformed_framing_is_invalid_data() {
++        for wire in [
++            &b"X\r\n"[..],
++            b"1X\r\n",
++            b"-1\r\n",
++            b"+1\r\na\r\n0\r\n\r\n",
++            b"\r\n",
++            b"1 A\r\n",
++            b"F\rF",
++            b"1\r\nab\r\n",
++            b"10000000000000000\r\n",
++            b"0\r\nTrailer: x\r\n\r\n",
++        ] {
++            let err = decode(wire).unwrap_err();
++            assert_eq!(err.kind(), ErrorKind::InvalidData, "{:?}", wire);
++        }
++    }
++}
+diff -ruN a/src/util/equal_reader.rs b/src/util/equal_reader.rs
+--- a/src/util/equal_reader.rs
++++ b/src/util/equal_reader.rs
+@@ -1,36 +1,32 @@
+ use std::io::Read;
+ use std::io::Result as IoResult;
+-use std::sync::mpsc::channel;
+-use std::sync::mpsc::{Receiver, Sender};
++use std::io::{Error as IoError, ErrorKind};
+ 
+ /// A `Reader` that reads exactly the number of bytes from a sub-reader.
+ ///
+-/// If the limit is reached, it returns EOF. If the limit is not reached
+-/// when the destructor is called, the remaining bytes will be read and
+-/// thrown away.
++/// If the limit is reached, it returns EOF.
++///
++/// FORGE PATCH (FORGE_PATCHES.md #1): upstream read and discarded whatever was left of
++/// the body when this was dropped, through `vec![0; remaining]` — a buffer the size of
++/// the client's *declared* `Content-Length`. One request declaring more than RAM + swap
++/// aborted the process, and a client that declared a body and never sent it blocked the
++/// dropping thread indefinitely (there is no socket read timeout). Nothing is discarded
++/// here any more: `BodyReader` reports whether the body was read to its end, and the
++/// connection is closed rather than re-synchronised when it was not.
+ pub struct EqualReader<R>
+ where
+     R: Read,
+ {
+     reader: R,
+     size: usize,
+-    last_read_signal: Sender<IoResult<()>>,
+ }
+ 
+ impl<R> EqualReader<R>
+ where
+     R: Read,
+ {
+-    pub fn new(reader: R, size: usize) -> (EqualReader<R>, Receiver<IoResult<()>>) {
+-        let (tx, rx) = channel();
+-
+-        let r = EqualReader {
+-            reader,
+-            size,
+-            last_read_signal: tx,
+-        };
+-
+-        (r, rx)
++    pub fn new(reader: R, size: usize) -> EqualReader<R> {
++        EqualReader { reader, size }
+     }
+ }
+ 
+@@ -50,6 +46,13 @@
+         };
+ 
+         match self.reader.read(buf) {
++            // FORGE PATCH (#1): the connection ended before the declared length. Upstream
++            // reported a plain EOF, so a handler reading to the end could not tell a
++            // truncated body from a complete short one and would accept it as whole.
++            Ok(0) if !buf.is_empty() => Err(IoError::new(
++                ErrorKind::UnexpectedEof,
++                "connection closed before the declared Content-Length was received",
++            )),
+             Ok(len) => {
+                 self.size -= len;
+                 Ok(len)
+@@ -59,33 +62,6 @@
+     }
+ }
+ 
+-impl<R> Drop for EqualReader<R>
+-where
+-    R: Read,
+-{
+-    fn drop(&mut self) {
+-        let mut remaining_to_read = self.size;
+-
+-        while remaining_to_read > 0 {
+-            let mut buf = vec![0; remaining_to_read];
+-
+-            match self.reader.read(&mut buf) {
+-                Err(e) => {
+-                    self.last_read_signal.send(Err(e)).ok();
+-                    break;
+-                }
+-                Ok(0) => {
+-                    self.last_read_signal.send(Ok(())).ok();
+-                    break;
+-                }
+-                Ok(other) => {
+-                    remaining_to_read -= other;
+-                }
+-            }
+-        }
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::EqualReader;
+@@ -98,7 +74,7 @@
+         let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
+ 
+         {
+-            let (mut equal_reader, _) = EqualReader::new(org_reader.by_ref(), 5);
++            let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
+ 
+             let mut string = String::new();
+             equal_reader.read_to_string(&mut string).unwrap();
+@@ -110,14 +86,17 @@
+         assert_eq!(string, " world");
+     }
+ 
++    // FORGE PATCH (#1): upstream's `test_not_enough` asserted that dropping a partly-read
++    // body discarded the rest. Dropping now leaves it unread; the connection layer closes
++    // the connection instead of reading on.
+     #[test]
+-    fn test_not_enough() {
++    fn dropping_a_partly_read_body_discards_nothing() {
+         use std::io::Cursor;
+ 
+         let mut org_reader = Cursor::new("hello world".to_string().into_bytes());
+ 
+         {
+-            let (mut equal_reader, _) = EqualReader::new(org_reader.by_ref(), 5);
++            let mut equal_reader = EqualReader::new(org_reader.by_ref(), 5);
+ 
+             let mut vec = [0];
+             equal_reader.read_exact(&mut vec).unwrap();
+@@ -126,6 +105,26 @@
+ 
+         let mut string = String::new();
+         org_reader.read_to_string(&mut string).unwrap();
+-        assert_eq!(string, " world");
++        assert_eq!(string, "ello world");
++    }
++
++    #[test]
++    fn a_huge_declared_length_costs_nothing_when_dropped() {
++        use std::io::Cursor;
++
++        let mut org_reader = Cursor::new(b"abc".to_vec());
++        drop(EqualReader::new(org_reader.by_ref(), usize::MAX / 2));
++        assert_eq!(org_reader.position(), 0);
++    }
++
++    #[test]
++    fn a_body_cut_short_is_an_error_not_a_short_body() {
++        use std::io::Cursor;
++
++        let mut equal_reader = EqualReader::new(Cursor::new(b"abc".to_vec()), 10);
++        let mut out = Vec::new();
++        let err = equal_reader.read_to_end(&mut out).unwrap_err();
++        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
++        assert_eq!(out, b"abc");
+     }
+ }
+diff -ruN a/src/util/mod.rs b/src/util/mod.rs
+--- a/src/util/mod.rs
++++ b/src/util/mod.rs
+@@ -1,3 +1,5 @@
++pub use self::body_reader::BodyReader; // FORGE PATCH (#1)
++pub use self::chunked_decoder::ChunkedDecoder; // FORGE PATCH (#3)
+ pub use self::custom_stream::CustomStream;
+ pub use self::equal_reader::EqualReader;
+ pub use self::fused_reader::FusedReader;
+@@ -9,6 +11,8 @@
+ 
+ use std::str::FromStr;
+ 
++mod body_reader; // FORGE PATCH (#1)
++mod chunked_decoder; // FORGE PATCH (#3)
+ mod custom_stream;
+ mod equal_reader;
+ mod fused_reader;
+diff -ruN a/src/util/refined_tcp_stream.rs b/src/util/refined_tcp_stream.rs
+--- a/src/util/refined_tcp_stream.rs
++++ b/src/util/refined_tcp_stream.rs
+@@ -12,12 +12,14 @@
+     Https(SslStream),
+ }
+ 
+-impl Clone for Stream {
+-    fn clone(&self) -> Self {
++impl Stream {
++    /// FORGE PATCH (#6): upstream's `Clone` unwrapped this, so a connection accepted with
++    /// the process's last free file descriptor panicked the accept thread.
++    fn try_clone(&self) -> IoResult<Stream> {
+         match self {
+-            Stream::Http(tcp_stream) => Stream::Http(tcp_stream.try_clone().unwrap()),
++            Stream::Http(tcp_stream) => tcp_stream.try_clone().map(Stream::Http),
+             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+-            Stream::Https(ssl_stream) => Stream::Https(ssl_stream.clone()),
++            Stream::Https(ssl_stream) => Ok(Stream::Https(ssl_stream.clone())),
+         }
+     }
+ }
+@@ -89,13 +91,14 @@
+ }
+ 
+ impl RefinedTcpStream {
+-    pub(crate) fn new<S>(stream: S) -> (RefinedTcpStream, RefinedTcpStream)
++    pub(crate) fn new<S>(stream: S) -> IoResult<(RefinedTcpStream, RefinedTcpStream)>
+     where
+         S: Into<Stream>,
+     {
+         let stream: Stream = stream.into();
+ 
+-        let (read, write) = (stream.clone(), stream);
++        // FORGE PATCH (#6): fallible; see `Stream::try_clone`.
++        let (read, write) = (stream.try_clone()?, stream);
+ 
+         let read = RefinedTcpStream {
+             stream: read,
+@@ -109,7 +112,7 @@
+             close_write: true,
+         };
+ 
+-        (read, write)
++        Ok((read, write))
+     }
+ 
+     /// Returns true if this struct wraps around a secure connection.
+diff -ruN a/src/util/task_pool.rs b/src/util/task_pool.rs
+--- a/src/util/task_pool.rs
++++ b/src/util/task_pool.rs
+@@ -80,7 +80,12 @@
+     fn add_thread(&self, initial_fn: Option<Box<dyn FnMut() + Send>>) {
+         let sharing = self.sharing.clone();
+ 
+-        thread::spawn(move || {
++        // FORGE PATCH (#6): upstream used `thread::spawn`, which panics when the OS refuses
++        // a thread. This runs on the accept thread, and every connection that is held
++        // open pins a thread, so enough of them under a process or container limit took
++        // the accept thread down, and a `panic = "abort"` build with it. On failure the
++        // task, and with it the connection it would have served, is dropped instead.
++        let spawned = thread::Builder::new().spawn(move || {
+             let sharing = sharing;
+             let _active_guard = Registration::new(&sharing.active_tasks);
+ 
+@@ -124,6 +129,9 @@
+                 task();
+             }
+         });
++        if let Err(e) = spawned {
++            log::error!("Could not start a connection thread: {}", e);
++        }
+     }
+ }
+ 

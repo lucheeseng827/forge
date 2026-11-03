@@ -51,3 +51,6 @@ wiremock = "0.6"
 # `process` (for the crash/kill integration test) on top of the workspace features;
 # additive, so it only affects test builds and adds no new locked crates.
 tokio = { workspace = true, features = ["process"] }
+# SO_LINGER, so tests/hostile_http.rs can reset a connection (std's `set_linger` is
+# unstable). Already in the lock through tokio, so it adds no new locked crates.
+socket2 = "0.6"

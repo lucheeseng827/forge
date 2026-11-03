@@ -52,8 +52,8 @@ GPUs; your engines stay where they are, and the boxes on the right are yours.
 
 | Tag | What |
 |---|---|
-| `latest`, `v0.2.0` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
-| `v0.2.0-amd64`, `v0.2.0-arm64` (and prior versions) | pinned single-arch |
+| `latest`, `v0.3.0` | multi-arch manifest: `linux/amd64` + `linux/arm64` |
+| `v0.3.0-amd64`, `v0.3.0-arm64` (and prior versions) | pinned single-arch |
 
 ## Quick start — run a batch
 
@@ -61,7 +61,7 @@ GPUs; your engines stay where they are, and the boxes on the right are yours.
 # input.jsonl: one OpenAI Batch-format request per line, keyed by custom_id
 docker run --rm --network host --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" -w /work \
-  mancube/forge:v0.2.0 \
+  mancube/forge:v0.3.0 \
   run --input input.jsonl \
       --workers http://gpu1:8000,http://gpu2:8000 \
       --engine vllm --concurrency 256 \
@@ -73,9 +73,9 @@ Kill it mid-run (or lose the box) and run the same command again — it
 re-run, and `verify` proves every input id reached a terminal result.
 
 ```sh
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/forge:v0.2.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/forge:v0.3.0 \
   status --checkpoint state.db          # counts, success rate, failure mix
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/forge:v0.2.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/forge:v0.3.0 \
   verify --input input.jsonl --results results.jsonl
 ```
 
@@ -88,27 +88,30 @@ writable.
 ## Quick start — the OpenAI Batch REST front door
 
 ```sh
-docker run --rm -p 8080:8080 -v forge-data:/data \
-  mancube/forge:v0.2.0 \
+docker run --rm -p 8080:8080 -v forge-data:/data -e FORGE_API_KEY \
+  mancube/forge:v0.3.0 \
   serve-batch --listen 0.0.0.0:8080 --data-dir /data \
-    --workers http://gpu1:8000 --engine vllm --concurrency 256 \
-    --api-key "$FORGE_API_KEY"
+    --workers http://gpu1:8000 --engine vllm --concurrency 256
 ```
+
+The key comes from the environment (`-e FORGE_API_KEY` passes your shell's value
+through), so it never appears in the container's process list. `--api-key` still
+works, but it would.
 
 Unmodified OpenAI SDK code (`files.create` → `batches.create` → poll →
 `files.content`) then runs its batch flow against **your own engines** — with
-live per-item progress. (Results are retrievable once the batch reaches
-`completed` — that is the only state which stamps `output_file_id`, so a
-cancelled batch has no output file and there is no mid-run partial fetch
-through the OpenAI file contract.) `/v1/health` is
-the unauthenticated liveness route; everything else requires the bearer key.
+live per-item progress. The OpenAI contract only stamps `output_file_id` when a
+batch reaches `completed`; to read results **mid-run**, or from a cancelled or
+failed batch, use forge's `GET /v1/batches/{id}/results`, which streams every
+finished line and returns a cursor for tailing. `/v1/health` is the
+unauthenticated liveness route; everything else requires the bearer key.
 
 ## Kubernetes
 
 The chart is published as an OCI artifact right beside this image:
 
 ```sh
-helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.2.0 \
+helm install forge oci://registry-1.docker.io/mancube/forge-chart --version 0.3.0 \
   --set 'serveBatch.workers={http://vllm-0.engines.svc:8000}' \
   --set 'serveBatch.apiKey=<bearer key>'
 ```

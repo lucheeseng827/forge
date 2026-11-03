@@ -264,8 +264,8 @@ end-to-end against the `openai` Python SDK (`batches.create` / `retrieve` /
 `files.content`).
 
 ```sh
-forge serve-batch --listen 0.0.0.0:8080 --data-dir ./batchdata \
-  --workers http://gpu1:8000,http://gpu2:8000 --engine vllm --api-key "$KEY"
+FORGE_API_KEY="$KEY" forge serve-batch --listen 0.0.0.0:8080 --data-dir ./batchdata \
+  --workers http://gpu1:8000,http://gpu2:8000 --engine vllm
 ```
 
 ```python

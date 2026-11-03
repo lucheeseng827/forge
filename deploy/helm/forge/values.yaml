@@ -5,7 +5,10 @@ image:
   # repo-root Dockerfile. Override with your own registry if you build from
   # source.
   repository: docker.io/mancube/forge
-  tag: "v0.1.2"
+  # v0.3.0 or later reads the API key from FORGE_API_KEY. An older tag, or one the
+  # chart cannot read as a version, also gets it as `--api-key`: see
+  # serveBatch.apiKeyArg.
+  tag: "v0.3.0"
   pullPolicy: IfNotPresent
 
 # ── serve-batch: the long-running OpenAI Batch REST front door ────────────────
@@ -26,6 +29,12 @@ serveBatch:
   # …or reference an existing Secret (wins over apiKey when set).
   existingApiKeySecret: ""
   existingApiKeySecretKey: api-key
+  # Whether the key is also passed as `--api-key $(FORGE_API_KEY)`, which puts it in
+  # the container's process list. `auto`: only when image.tag is not a version of
+  # v0.3.0 or later. Images before v0.3.0 ignore FORGE_API_KEY, and
+  # `helm upgrade --reuse-values` keeps an old release's tag. `never`: for a custom tag
+  # built from v0.3.0 or later. `always`: pass it regardless.
+  apiKeyArg: auto
   extraArgs: []              # appended verbatim, e.g. ["--require", "json"]
 
 persistence:

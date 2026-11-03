@@ -26,6 +26,15 @@ pub struct FileObject {
     pub purpose: String,
 }
 
+/// The deletion object `DELETE /v1/files/{id}` answers with (the SDK's `FileDeleted`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDeleted {
+    pub id: String,
+    /// Always `"file"`.
+    pub object: String,
+    pub deleted: bool,
+}
+
 /// The `{total, completed, failed}` progress triple embedded in a [`BatchObject`].
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct RequestCounts {
@@ -56,19 +65,29 @@ pub struct BatchObject {
     pub request_counts: RequestCounts,
 }
 
-/// The list envelope OpenAI wraps collections in (`GET /v1/batches`).
+/// The list envelope OpenAI wraps collections in (`GET /v1/files`, `GET /v1/batches`).
+///
+/// `has_more` is load-bearing: the OpenAI SDKs page through a list by asking again with
+/// `?after=<id of the last item>` until it is `false`. Without it, they keep asking.
 #[derive(Debug, Clone, Serialize)]
 pub struct ListEnvelope<T> {
     /// Always `"list"`.
     pub object: String,
     pub data: Vec<T>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub has_more: bool,
 }
 
 impl<T> ListEnvelope<T> {
-    pub fn new(data: Vec<T>) -> Self {
+    /// One page of a listing, `id` reading each item's id, and whether more follow it.
+    pub fn page(data: Vec<T>, has_more: bool, id: impl Fn(&T) -> &str) -> Self {
         Self {
             object: "list".to_string(),
+            first_id: data.first().map(|t| id(t).to_string()),
+            last_id: data.last().map(|t| id(t).to_string()),
             data,
+            has_more,
         }
     }
 }
@@ -211,10 +230,20 @@ mod tests {
 
     #[test]
     fn list_envelope_shape() {
-        let env = ListEnvelope::new(vec![json!({"id": "batch-1"})]);
+        let data = vec![json!({"id": "batch-1"}), json!({"id": "batch-2"})];
+        let env = ListEnvelope::page(data, true, |v| v["id"].as_str().unwrap());
         let v = serde_json::to_value(&env).unwrap();
         assert_eq!(v["object"], "list");
         assert_eq!(v["data"][0]["id"], "batch-1");
+        assert_eq!(v["first_id"], "batch-1");
+        assert_eq!(v["last_id"], "batch-2");
+        assert_eq!(v["has_more"], true);
+
+        let empty = ListEnvelope::page(Vec::<Value>::new(), false, |_| "");
+        let v = serde_json::to_value(&empty).unwrap();
+        assert_eq!(v["first_id"], Value::Null);
+        assert_eq!(v["last_id"], Value::Null);
+        assert_eq!(v["has_more"], false);
     }
 
     #[test]

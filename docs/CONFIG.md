@@ -26,12 +26,15 @@ those change.
 | `FORGE_WORKER_API_KEY` | string | — | Optional bearer/API key for **hosted** worker endpoints (`--engine openai-api` → `Authorization: Bearer`; `--engine anthropic-api` → `x-api-key` + `anthropic-version`). Env-only by design — never a flag, never logged. Unset (the default) sends no auth headers at all. | Driving a hosted provider API instead of (or alongside) self-hosted engines. |
 | `FORGE_WORKER_API_KEY_<WORKER_ID>` | string | — | Per-worker override of the above, for the worker with that id (id upper-cased, every non-alphanumeric byte → `_`, so `spill` reads `FORGE_WORKER_API_KEY_SPILL` and `gpu-1` reads `FORGE_WORKER_API_KEY_GPU_1`). Falls back to the global variable when unset. | A fleet spanning **two hosted providers** — one process-global key cannot be both an OpenAI key and an Anthropic key. Name the workers with `--workers 'name=engine:url'`. |
 
+| `FORGE_API_KEY` | string | — | `forge serve-batch`'s bearer key, the same setting as `--api-key` (the flag wins when both are set). Prefer this form: a flag value sits in `/proc/<pid>/cmdline`, readable by anything that can list processes on the host. A set-but-blank value is a startup error, because an empty key would accept `Bearer ` with nothing after it. `--help` never prints the value. | Any `serve-batch` reachable from beyond loopback. |
+| `FORGE_COORDINATOR_TOKEN` | string | — | The shared token on the coordinator wire. `forge-agent serve` requires it on every route, and `forge-agent run` sends it. Env-only by design: there is no flag. Required for `serve` on any non-loopback bind (or pass `--insecure-no-auth`). A blank value is a startup error. | Every coordinator its agents reach over a network. Set the same value on the coordinator and every agent. |
 | `FORGE_LOG_FORMAT` | `text` \| `json` | `text` | Log output format for `forge`. `json` emits one JSON object per line for a log shipper. Equivalent to the global `--log-format` flag, which wins when both are set; an unparseable value warns and falls back to `text` rather than refusing to start. Logs go to **stderr** — stdout carries a command's own output, so `--json` payloads stay pipeable. | A deployment shipping logs to Loki/CloudWatch/Datadog. Set it once in the Deployment rather than on every command. |
 | `FORGE_GIT_SHA` | string | — | **Build-time only** (`--build-arg`/`cargo` env at compile time, not read at runtime). Stamps the commit into the startup log line, `forge --version` and `/v1/health`. Deliberately absent rather than guessed when a build does not supply one: a release container has no `.git`, so a `build.rs` that shelled out to git would bake in `unknown` or a stale sha from someone's laptop, and a wrong sha sends someone diffing the wrong commit. | Always, in a release build: `docker build --build-arg FORGE_GIT_SHA="$(git rev-parse --short HEAD)" .` |
 
-That is the whole list — the default binary deliberately reads no env var but
-`RUST_LOG`, `FORGE_LOG_FORMAT` and (opt-in) `FORGE_WORKER_API_KEY`; with the key unset
-it sends **no** auth headers to workers (see
+That is the whole list. The default binary deliberately reads no env var but
+`RUST_LOG`, `FORGE_LOG_FORMAT`, the opt-in `FORGE_WORKER_API_KEY`, and the two server
+secrets (`FORGE_API_KEY` for `serve-batch`, `FORGE_COORDINATOR_TOKEN` for
+`forge-agent`). With the worker key unset it sends **no** auth headers to workers (see
 [OPERATIONS §security](./OPERATIONS.md#security-posture)).
 
 ## `forge` CLI
@@ -161,7 +164,7 @@ engine, so unmodified OpenAI-SDK code pointed at forge runs its batch flow. Sour
 |---|---|---|---|
 | `--listen` | `host:port` | `127.0.0.1:8080` | Bind address for the REST server. |
 | `--data-dir` | path | **required** | Root for uploaded files (`files/`) + per-batch checkpoints & results (`batches/<id>/`). Enough persists here that a **restart resumes**: batches are re-listed, any that drained while the server was down are re-finalized, and any left in flight have their fan-out restarted from the checkpoint. Do **not** run `forge resume` against a served batch — the restarted server is already draining that `ckpt.db`, and a second coordinator on one checkpoint is exactly what the lease fencing exists to prevent. |
-| `--api-key` | string | *(none)* | Optional bearer token. When set, every route except `/v1/health` requires `Authorization: Bearer <token>`; unset = open (trust the network). |
+| `--api-key` | string | *(none)*, or `FORGE_API_KEY` | Optional bearer token. When set, every route except `/v1/health` requires `Authorization: Bearer <token>`. Unset means open (trust the network), and an open server on a non-loopback `--listen` logs a warning at startup. **Prefer `FORGE_API_KEY`**: a flag value is visible in the process list. An empty value is refused. |
 | `--threads` | usize | `2` | HTTP accept threads sharing the listener. |
 | *(worker flags)* | | | The [Worker/dispatch flags](#workerdispatch-flags-shared-by-run-and-resume) — the fleet every batch fans out across. |
 
@@ -193,15 +196,20 @@ binary; the plain `forge` CLI never needs it.
 | `--lease-secs` | u64 | `120` | Lease visibility timeout requested from the coordinator. |
 | `--interval-secs` | u64 | `5` | Spot-watch poll interval. |
 
+Sends `FORGE_COORDINATOR_TOKEN` as a bearer token when it is set. Against a coordinator
+that requires one, an agent without it, or with the wrong one, stops at its first
+pull with a `401` error that names the variable.
+
 ### `forge-agent serve` — the coordinator side of the wire protocol
 
 | flag | type | default | what it does |
 |---|---|---|---|
 | `--queue` | path | **required** | The SQLite queue DB (hydrate it separately, e.g. via `forge run`'s ingest). |
 | `--out` | path | **required** | Results JSONL the coordinator writes (store-then-ack; single writer). |
-| `--bind` | addr | `127.0.0.1:8080` | Bind address. **Loopback by default and unauthenticated** — a public bind would let any reachable host pull prompts or forge results. Widen only behind your own network controls. |
+| `--bind` | addr | `127.0.0.1:8080` | Bind address. **Loopback by default.** Any other bind requires `FORGE_COORDINATOR_TOKEN`, and without it `serve` exits before opening the queue. An open coordinator lets any reachable host pull prompts or post forged results. |
 | `--lease-secs` | u64 | `120` | Default lease TTL when a pull doesn't ask (`lease_secs: 0`). |
 | `--threads` | usize | `4` | Accept threads (blocking `tiny_http`; the queue's atomic lease keeps concurrent pulls disjoint). |
+| `--insecure-no-auth` | bool | `false` | Serve a non-loopback bind with **no** token. Only for a network where every host that can reach the port is already trusted with every prompt and result. Logs a warning, and is ignored when `FORGE_COORDINATOR_TOKEN` is set. |
 
 ## Cargo features
 

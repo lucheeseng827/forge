@@ -1,0 +1,46 @@
+# Vendored copy of tiny_http 0.12.0 (crates.io; upstream git 212b1c45852fef2093dc1374875a9393c55eb4b9),
+# patched. See FORGE_PATCHES.md for every change and why. Wired in through
+# `[patch.crates-io]` in both forge workspaces, so the version stays 0.12.0 to satisfy
+# their `tiny_http = "0.12"` requirements. Upstream's dev-dependencies are dropped along
+# with its tests/, examples/ and benches/, which are not vendored.
+
+[package]
+name = "tiny_http"
+version = "0.12.0"
+authors = ["pierre.krieger1708@gmail.com",
+           "Corey Farwell <coreyf@rwell.org>"]
+description = "Low level HTTP server library (forge-patched vendored copy; see FORGE_PATCHES.md)"
+documentation = "https://tiny-http.github.io/tiny-http/tiny_http/index.html"
+keywords = ["http", "server", "web"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tiny-http/tiny-http"
+edition = "2018"
+publish = false
+
+[features]
+default = []
+ssl = ["ssl-openssl"]
+ssl-openssl = ["openssl", "zeroize"]
+ssl-rustls = ["rustls", "rustls-pemfile", "zeroize"]
+
+[dependencies]
+ascii = "1.0"
+chunked_transfer = "1"
+log = "0.4.4"
+httpdate = "1.0.2"
+
+openssl = { version = "0.10", optional = true }
+rustls = { version = "0.20", optional = true }
+rustls-pemfile = { version = "0.2.1", optional = true }
+zeroize = { version = "1", optional = true }
+
+[package.metadata.docs.rs]
+# Enable just one SSL implementation
+features = ["ssl-openssl"]
+
+# Two warnings upstream's own code raises under current rustc (an unused re-export and
+# an unused marker trait). This is not forge's code to lint, and the noise would print
+# on every forge build, burying warnings that are forge's.
+[lints.rust]
+unused_imports = "allow"
+dead_code = "allow"

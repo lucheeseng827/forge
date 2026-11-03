@@ -40,6 +40,8 @@ Placement rules:
 - The optional topology for spot fleets: `forge-agent serve` next to the queue,
   `forge-agent run --coordinator … --engine http://127.0.0.1:8000 --cloud aws` on
   each spot box (see [API.md §2](./API.md#2-coordinator-http-protocol-forge-proto)).
+  Give both sides the same `FORGE_COORDINATOR_TOKEN`: `serve` will not start on a
+  non-loopback bind without it.
 
 ## State & backup
 
@@ -471,12 +473,23 @@ a disclosure policy.
   injects auth). Driving a **hosted** provider endpoint is the one opt-in exception:
   `FORGE_WORKER_API_KEY` (env-only, never a flag, never logged) is sent in the
   provider's own header style per the `--engine` hint.
-- **`forge-agent serve` is an unauthenticated JSON-over-HTTP listener**, bound to
-  `127.0.0.1:8080` by default. Anyone who can reach it can pull prompts (data
-  exfiltration) and post results (forgery — fenced by lease generation against
-  *staleness*, not against malice). Widen the bind only inside a trusted network
-  boundary (VPC security group / firewall / mTLS reverse proxy). There is no TLS,
-  authn, or authz in the OSS protocol; that is the operator's layer.
+- **`forge-agent serve` is a JSON-over-HTTP listener guarded by a shared token**
+  (`FORGE_COORDINATOR_TOKEN`), bound to `127.0.0.1:8080` by default. Without the
+  token, anyone who can reach it can pull prompts (data exfiltration) and post
+  results (forgery — lease fencing guards against *staleness*, not malice), which is
+  why `serve` refuses a non-loopback bind without one unless given
+  `--insecure-no-auth`. The token is a single shared secret, with no per-agent
+  identity or scopes, and it is sent in plain HTTP: put TLS in front (a reverse
+  proxy or mesh) on any network you do not trust.
+- **`forge serve-batch`** takes its key from `FORGE_API_KEY` (or `--api-key`, which
+  is visible in the process list). Without one it serves every route open, and
+  warns at startup when its `--listen` is not loopback.
+- **Both servers run on a patched tiny_http** (`vendor/tiny_http/FORGE_PATCHES.md`).
+  A hostile request or connection cannot abort or deadlock them, a request whose body
+  was not read gets its connection closed after the response, and an accept error
+  (running out of file descriptors, say) no longer stops them accepting. There are no
+  read timeouts, so idle connections are held until the client hangs up: on an
+  untrusted network, put a proxy with timeouts in front.
 - **Data at rest is plaintext**: prompts in the checkpoint DB, responses in the
   results JSONL. Apply disk encryption / bucket policies per your data class; with
   the `object_store` backend, bucket IAM is the control.

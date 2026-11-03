@@ -36,7 +36,8 @@ spec:
             - {{ .Values.serveBatch.engine }}
             - --concurrency
             - {{ .Values.serveBatch.concurrency | quote }}
-            {{- if include "forge.apiKeySecretName" . }}
+            {{- if and (include "forge.apiKeySecretName" .) (include "forge.apiKeyAsArg" .) }}
+            # The image may predate FORGE_API_KEY; see serveBatch.apiKeyArg.
             - --api-key
             - $(FORGE_API_KEY)
             {{- end }}
@@ -44,6 +45,11 @@ spec:
             - {{ . | quote }}
             {{- end }}
           {{- if include "forge.apiKeySecretName" . }}
+          # Read by serve-batch from the environment (forge >= 0.3.0). For such an image
+          # it is not also rendered as `--api-key $(FORGE_API_KEY)`: an argument lands in
+          # /proc/<pid>/cmdline, where anything that can list processes on the node can
+          # read it. An older or unrecognised image tag gets the argument as well, since
+          # an image that ignores FORGE_API_KEY would otherwise serve with no key.
           env:
             - name: FORGE_API_KEY
               valueFrom:

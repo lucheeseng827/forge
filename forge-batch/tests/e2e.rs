@@ -502,6 +502,21 @@ async fn health_is_open_but_everything_else_needs_the_key() {
         .unwrap();
     assert_eq!(bad.status(), 401);
 
+    // The newer routes sit behind the same gate: listing files, deleting one, and
+    // reading a batch's results mid-run all reveal or destroy customer data.
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/files"),
+        (reqwest::Method::DELETE, "/v1/files/file-x"),
+        (reqwest::Method::GET, "/v1/batches/batch-x/results"),
+    ] {
+        let r = client
+            .request(method.clone(), format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "{method} {path} without the key");
+    }
+
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1000,6 +1015,653 @@ async fn every_response_carries_a_request_id_and_a_hostile_one_is_sanitised() {
             "{c:?} survived into a response header: {echoed}"
         );
     }
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── files list / delete (OpenAI SDK parity) ──────────────────────────────────
+
+/// Upload `body` as a batch input file and return its id.
+async fn upload(client: &reqwest::Client, base: &str, body: String) -> String {
+    let f: Value = client
+        .post(format!("{base}/v1/files"))
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    f["id"].as_str().unwrap().to_string()
+}
+
+/// Create a batch over `input_file_id` and return its id.
+async fn create(client: &reqwest::Client, base: &str, input_file_id: &str) -> String {
+    let b: Value = client
+        .post(format!("{base}/v1/batches"))
+        .json(&serde_json::json!({
+            "input_file_id": input_file_id, "endpoint": "/v1/chat/completions"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    b["id"].as_str().unwrap().to_string()
+}
+
+/// Poll a batch until it reports `status`, returning the batch object.
+async fn wait_for_status(client: &reqwest::Client, base: &str, id: &str, status: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let b: Value = client
+            .get(format!("{base}/v1/batches/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if b["status"] == status {
+            return b;
+        }
+        assert!(Instant::now() < deadline, "never reached {status}: {b}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn listed_ids(list: &Value) -> Vec<String> {
+    assert_eq!(list["object"], "list");
+    list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `client.files.list()` and `client.files.delete()` are the first cleanup calls
+/// existing SDK code makes, and both used to answer `404 no such route`.
+#[tokio::test]
+async fn files_list_and_delete_follow_the_openai_sdk_contract() {
+    let dir = tmp_dir("files");
+    let server = serve_batch(slow_config(dir.clone())).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    let busy_input = upload(
+        &client,
+        &base,
+        (0..5)
+            .map(|i| input_line(&format!("a-{i}")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .await;
+    let spare = upload(&client, &base, input_line("b-0")).await;
+
+    // Both inputs list, and a purpose filter narrows the list.
+    let list: Value = client
+        .get(format!("{base}/v1/files"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids = listed_ids(&list);
+    assert!(ids.contains(&busy_input) && ids.contains(&spare), "{list}");
+    assert!(list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|f| f["purpose"] == "batch"));
+    let outputs: Value = client
+        .get(format!("{base}/v1/files?purpose=batch_output"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed_ids(&outputs).is_empty(), "{outputs}");
+
+    // The input of an in-progress batch cannot be deleted: a restart would re-read it.
+    let batch = create(&client, &base, &busy_input).await;
+    let r = client
+        .delete(format!("{base}/v1/files/{busy_input}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(r.text().await.unwrap().contains(&batch));
+    let r = client
+        .get(format!("{base}/v1/files/{busy_input}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "a refused delete leaves the file in place");
+
+    // A file nothing is using is deleted: the SDK's FileDeleted shape, record and bytes gone.
+    let deleted: Value = client
+        .delete(format!("{base}/v1/files/{spare}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted,
+        serde_json::json!({"id": spare, "object": "file", "deleted": true})
+    );
+    for path in [
+        format!("/v1/files/{spare}"),
+        format!("/v1/files/{spare}/content"),
+    ] {
+        let r = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 404, "{path}");
+    }
+    let r = client
+        .delete(format!("{base}/v1/files/{spare}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404, "a second delete finds nothing");
+    assert!(
+        !dir.join("files").join(format!("{spare}.jsonl")).exists(),
+        "the bytes are removed, not just the record"
+    );
+
+    // Once the batch is done, both its input and its output can go — and the batch still
+    // describes itself.
+    let done = wait_for_status(&client, &base, &batch, "completed").await;
+    let output = done["output_file_id"].as_str().unwrap().to_string();
+    let outputs: Value = client
+        .get(format!("{base}/v1/files?purpose=batch_output"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed_ids(&outputs), vec![output.clone()]);
+    for id in [&busy_input, &output] {
+        let r = client
+            .delete(format!("{base}/v1/files/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{id}");
+    }
+    let r = client
+        .get(format!("{base}/v1/files/{output}/content"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let b = wait_for_status(&client, &base, &batch, "completed").await;
+    assert_eq!(b["request_counts"]["completed"], 5);
+    server.shutdown();
+
+    // Deletions are persisted: a restart does not resurrect any of the three.
+    let server = serve_batch(slow_config(dir.clone())).expect("re-serve");
+    let list: Value = client
+        .get(format!("{}/v1/files", server.base_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed_ids(&list).is_empty(), "{list}");
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── mid-run results (forge extension) ────────────────────────────────────────
+
+/// A GET of `/results` from `cursor`: (status header, next cursor, custom_ids served).
+async fn read_results(
+    client: &reqwest::Client,
+    base: &str,
+    batch: &str,
+    query: &str,
+) -> (String, u64, Vec<String>) {
+    let r = client
+        .get(format!("{base}/v1/batches/{batch}/results?{query}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{query}");
+    assert_eq!(r.headers()["content-type"], "application/jsonl");
+    let status = r.headers()["x-forge-batch-status"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let next: u64 = r.headers()["x-forge-next-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ids = r
+        .text()
+        .await
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            // The same OpenAI output-line shape the finished output file uses.
+            assert!(v["id"].as_str().unwrap().starts_with("batch_req_"));
+            v["custom_id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    (status, next, ids)
+}
+
+/// On a large batch nothing used to be readable until the last item landed: the
+/// OpenAI contract only stamps `output_file_id` at completion. `/results` serves what
+/// is already written, and a cursor lets a client tail it without re-downloading.
+#[tokio::test]
+async fn results_can_be_tailed_mid_run_and_add_up_to_the_output_file() {
+    let dir = tmp_dir("tail");
+    let server = serve_batch(slow_config(dir.clone())).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    let n = 6;
+    let input = upload(
+        &client,
+        &base,
+        (0..n)
+            .map(|i| input_line(&format!("t-{i}")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .await;
+    let batch = create(&client, &base, &input).await;
+
+    // Tail until the batch is terminal AND a read comes back empty — the documented
+    // "you have everything" condition.
+    let mut cursor = 0u64;
+    let mut tailed: Vec<String> = Vec::new();
+    let mut read_while_running = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, next, ids) =
+            read_results(&client, &base, &batch, &format!("after={cursor}")).await;
+        assert!(next >= cursor, "the cursor never moves backwards");
+        if status == "in_progress" {
+            read_while_running += ids.len();
+        }
+        let empty = ids.is_empty();
+        tailed.extend(ids);
+        cursor = next;
+        if status == "completed" && empty {
+            break;
+        }
+        assert!(Instant::now() < deadline, "tail never finished: {tailed:?}");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    assert!(
+        read_while_running > 0,
+        "results were readable before the batch finished"
+    );
+
+    // Every result exactly once: a cursor never re-sends a line…
+    let mut unique = tailed.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        tailed.len(),
+        "duplicates in the tail: {tailed:?}"
+    );
+    // …and the tail is the finished output file, by custom_id.
+    let done = wait_for_status(&client, &base, &batch, "completed").await;
+    let output = done["output_file_id"].as_str().unwrap().to_string();
+    let mut final_ids: Vec<String> = client
+        .get(format!("{base}/v1/files/{output}/content"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["custom_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    final_ids.sort();
+    assert_eq!(unique, final_ids);
+    assert_eq!(unique.len(), n);
+
+    // A clean batch's error stream exists and is empty.
+    let (_, next, ids) = read_results(&client, &base, &batch, "kind=error").await;
+    assert_eq!((next, ids.len()), (0, 0));
+
+    // Requests that could only start mid-record, or that name nothing, are refused.
+    for (query, why) in [
+        ("kind=bogus", "unknown kind"),
+        ("after=abc", "not a number"),
+        ("after=1", "mid-line"),
+        ("after=99999999", "past the end"),
+    ] {
+        let r = client
+            .get(format!("{base}/v1/batches/{batch}/results?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{why}");
+    }
+    let r = client
+        .get(format!("{base}/v1/batches/batch-nope/results"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // Deleting the output file deletes the results behind `/results` too: no copy is
+    // left for the API to keep serving after the customer asked for it to be gone.
+    let r = client
+        .delete(format!("{base}/v1/files/{output}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let (_, next, ids) = read_results(&client, &base, &batch, "").await;
+    assert_eq!((next, ids.len()), (0, 0));
+    let r = client
+        .get(format!("{base}/v1/batches/{batch}/results?after={cursor}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        400,
+        "an old cursor now points past the (empty) end"
+    );
+
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── review fixes: paging, cancel, the create/delete race ─────────────────────
+
+/// GET `path` and return the JSON body.
+async fn get_json(client: &reqwest::Client, url: String) -> Value {
+    let r = client.get(&url).send().await.unwrap();
+    assert_eq!(r.status(), 200, "{url}");
+    r.json().await.unwrap()
+}
+
+/// The OpenAI SDKs page a list by asking again with `?after=<last_id>` until
+/// `has_more` is false. With no `has_more`, and `after` ignored, `for f in
+/// client.files.list()` never ended: every page was the whole list again.
+#[tokio::test]
+async fn lists_page_the_way_the_openai_sdks_iterate_them() {
+    let dir = tmp_dir("paging");
+    let server = serve_batch(config(dir.clone(), None)).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    for i in 0..5 {
+        upload(&client, &base, input_line(&format!("p-{i}"))).await;
+    }
+
+    // A plain GET lists everything, and says so.
+    let all = get_json(&client, format!("{base}/v1/files")).await;
+    let every = listed_ids(&all);
+    assert_eq!(every.len(), 5);
+    assert_eq!(all["has_more"], false);
+    assert_eq!(all["first_id"], every[0].as_str());
+    assert_eq!(all["last_id"], every[4].as_str());
+
+    // Iterate exactly as the SDK does: same order, nothing twice, and it ends.
+    let mut seen = Vec::new();
+    let mut url = format!("{base}/v1/files?limit=2");
+    for page_no in 1.. {
+        assert!(page_no <= 3, "five files in pages of two take three pages");
+        let page = get_json(&client, url).await;
+        seen.extend(listed_ids(&page));
+        if page["has_more"] == false {
+            break;
+        }
+        url = format!(
+            "{base}/v1/files?limit=2&after={}",
+            page["last_id"].as_str().unwrap()
+        );
+    }
+    assert_eq!(seen, every);
+
+    // Past the last item: an empty page that ends the iteration.
+    let tail = get_json(&client, format!("{base}/v1/files?after={}", every[4])).await;
+    assert!(listed_ids(&tail).is_empty());
+    assert_eq!(
+        (tail["has_more"].clone(), tail["last_id"].clone()),
+        (Value::Bool(false), Value::Null)
+    );
+
+    // A cursor naming nothing, or a limit that is not a positive integer, is refused.
+    for query in ["after=file-gone", "limit=0", "limit=two"] {
+        let r = client
+            .get(format!("{base}/v1/files?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{query}");
+    }
+
+    // Batches page the same way.
+    let input = upload(&client, &base, input_line("b")).await;
+    for _ in 0..3 {
+        create(&client, &base, &input).await;
+    }
+    let first = get_json(&client, format!("{base}/v1/batches?limit=2")).await;
+    assert_eq!(
+        (listed_ids(&first).len(), first["has_more"].clone()),
+        (2, Value::Bool(true))
+    );
+    let rest = get_json(
+        &client,
+        format!(
+            "{base}/v1/batches?limit=2&after={}",
+            first["last_id"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(
+        (listed_ids(&rest).len(), rest["has_more"].clone()),
+        (1, Value::Bool(false))
+    );
+    let all = get_json(&client, format!("{base}/v1/batches")).await;
+    assert_eq!(
+        (listed_ids(&all).len(), all["has_more"].clone()),
+        (3, Value::Bool(false))
+    );
+
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/results` is the only way to read a cancelled batch's results, and its readers stop
+/// once the status is terminal and a read comes back empty. Cancel used to report
+/// `cancelled` at once while the run went on writing, so results landing afterwards
+/// were lost to them. The batch is now `cancelling` until nothing of the run is left.
+#[tokio::test]
+async fn a_cancelled_batch_writes_nothing_once_it_reports_cancelled() {
+    let dir = tmp_dir("cancel-tail");
+    let client = reqwest::Client::new();
+    let batch = {
+        let server = serve_batch(slow_config(dir.clone())).expect("serve");
+        let base = server.base_url();
+        let input = upload(
+            &client,
+            &base,
+            (0..10)
+                .map(|i| input_line(&format!("c-{i}")))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await;
+        let batch = create(&client, &base, &input).await;
+
+        // Cancel mid-run, once a result has landed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while read_results(&client, &base, &batch, "").await.2.is_empty() {
+            assert!(Instant::now() < deadline, "no result ever landed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cancel: Value = client
+            .post(format!("{base}/v1/batches/{batch}/cancel"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            cancel["status"] == "cancelling" || cancel["status"] == "cancelled",
+            "{cancel}"
+        );
+        let done = wait_for_status(&client, &base, &batch, "cancelled").await;
+        assert!(done["cancelled_at"].is_i64(), "{done}");
+
+        // Read everything there is, the documented way...
+        let (mut cursor, mut got) = (0u64, 0usize);
+        loop {
+            let (status, next, ids) =
+                read_results(&client, &base, &batch, &format!("after={cursor}")).await;
+            assert_eq!(status, "cancelled");
+            cursor = next;
+            if ids.is_empty() {
+                break;
+            }
+            got += ids.len();
+        }
+        assert!(
+            (1..10).contains(&got),
+            "a cancel mid-run keeps a part: {got}"
+        );
+        // ...and nothing arrives after that, even once an item's time has passed.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let (_, next, ids) = read_results(&client, &base, &batch, &format!("after={cursor}")).await;
+        assert_eq!(
+            (next, ids.len()),
+            (cursor, 0),
+            "a result landed after `cancelled`"
+        );
+        server.shutdown();
+        batch
+    };
+
+    // A process that died while cancelling leaves `cancelling` on disk. Nothing will
+    // run that batch again, so the next process finishes its cancel.
+    let meta = dir.join("batches").join(&batch).join("batch.json");
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+    record["status"] = "cancelling".into();
+    record["cancelled_at"] = Value::Null;
+    std::fs::write(&meta, serde_json::to_vec(&record).unwrap()).unwrap();
+    let server = serve_batch(slow_config(dir.clone())).expect("re-serve");
+    let b = get_json(&client, format!("{}/v1/batches/{batch}", server.base_url())).await;
+    assert_eq!(b["status"], "cancelled", "{b}");
+    assert!(b["cancelled_at"].is_i64(), "{b}");
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch used to be registered in a second hold of the lock after its input was
+/// looked up, so a `DELETE` of the input landing in between found no in-progress batch
+/// and deleted the file the run was about to hydrate from: both calls answered 200 and
+/// the batch then failed.
+#[tokio::test]
+async fn deleting_an_input_never_races_a_batch_being_created_from_it() {
+    let dir = tmp_dir("create-delete");
+    let server = serve_batch(slow_config(dir.clone())).expect("serve");
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+    // Five slow items keep every batch in progress for the whole test.
+    let body = (0..5)
+        .map(|i| input_line(&format!("r-{i}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for _ in 0..25 {
+        let input = upload(&client, &base, body.clone()).await;
+        let (created, deleted) = tokio::join!(
+            client
+                .post(format!("{base}/v1/batches"))
+                .json(&serde_json::json!({
+                    "input_file_id": input, "endpoint": "/v1/chat/completions"
+                }))
+                .send(),
+            client.delete(format!("{base}/v1/files/{input}")).send(),
+        );
+        let (created, deleted) = (created.unwrap().status(), deleted.unwrap().status());
+        assert!(
+            matches!(
+                (created.as_u16(), deleted.as_u16()),
+                (200, 409) | (404, 200)
+            ),
+            "create {created}, delete {deleted}: exactly one of them must win"
+        );
+    }
+
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/results` reads a batch's raw results directly, so deleting the output file used to
+/// stop it serving them only once their bytes were gone. A crash between the registry
+/// write and the unlink, or a failed unlink, left them served after the customer had
+/// deleted them, and across restarts. A tombstone on the batch now goes first.
+#[tokio::test]
+async fn deleted_results_stay_deleted_even_if_their_bytes_survive() {
+    let dir = tmp_dir("delete-tombstone");
+    let client = reqwest::Client::new();
+    let server = serve_batch(config(dir.clone(), None)).expect("serve");
+    let base = server.base_url();
+    let input = upload(
+        &client,
+        &base,
+        (0..3)
+            .map(|i| input_line(&format!("d-{i}")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .await;
+    let batch = create(&client, &base, &input).await;
+    let done = wait_for_status(&client, &base, &batch, "completed").await;
+    let output = done["output_file_id"].as_str().unwrap().to_string();
+    let raw = dir.join("batches").join(&batch).join("out.jsonl");
+    let bytes = std::fs::read(&raw).unwrap();
+
+    let r = client
+        .delete(format!("{base}/v1/files/{output}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // As if the unlink had failed, or the process had died before it.
+    std::fs::write(&raw, &bytes).unwrap();
+    let (_, next, ids) = read_results(&client, &base, &batch, "").await;
+    assert_eq!((next, ids.len()), (0, 0), "deleted results were served");
+    server.shutdown();
+
+    // Across a restart too, and startup removes the bytes that were left behind.
+    let server = serve_batch(config(dir.clone(), None)).expect("re-serve");
+    let (_, next, ids) = read_results(&client, &server.base_url(), &batch, "").await;
+    assert_eq!(
+        (next, ids.len()),
+        (0, 0),
+        "deleted results were served after a restart"
+    );
+    assert!(!raw.exists(), "startup removes the deleted results' bytes");
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

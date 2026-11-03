@@ -23,7 +23,16 @@
 //! | `/v1/lease` | [`LeasePull`] | [`LeaseGrant`] |
 //! | `/v1/result` | [`ResultPost`] | [`AckReply`] |
 //! | `/v1/interruption` | [`InterruptionNotice`] | `{"ok":true}` |
+//!
+//! **Authentication.** Served with [`serve_coordinator_with`] and a
+//! [`CoordinatorConfig::token`], every route requires `Authorization: Bearer <token>`,
+//! checked in constant time **before** the body is read, and the agent sends it via
+//! [`HttpCoordinator::with_token`]. The wire hands out raw prompts and accepts the
+//! results that become the record, so an open coordinator lets anyone who can reach
+//! the port read prompts or forge results. [`serve_coordinator`] (no token) remains
+//! for a coordinator that is only reachable from inside its own trust boundary.
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,6 +48,11 @@ use forge_proto::{
 
 use crate::{from_wire_usage, Coordinator};
 
+/// Cap on one request body. A result post carries a single item's response, so even a
+/// large embedding batch sits far below this; the cap exists so that no caller can
+/// make an accept thread buffer an unbounded body into memory.
+const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
 fn transport(e: impl std::fmt::Display) -> ForgeError {
     ForgeError::Worker(format!("transport: {e}"))
 }
@@ -51,6 +65,7 @@ fn transport(e: impl std::fmt::Display) -> ForgeError {
 pub struct HttpCoordinator {
     client: reqwest::Client,
     base: String,
+    token: Option<String>,
 }
 
 impl HttpCoordinator {
@@ -64,7 +79,19 @@ impl HttpCoordinator {
         Ok(Self {
             client,
             base: base.into(),
+            token: None,
         })
+    }
+
+    /// Send `Authorization: Bearer <token>` on every request, for a coordinator served
+    /// with a [`CoordinatorConfig::token`]. A blank token is refused rather than sent:
+    /// it would be rejected by the server anyway, but only after the agent had started.
+    pub fn with_token(mut self, token: impl AsRef<str>) -> Result<Self, ForgeError> {
+        self.token = Some(forge_core::auth::non_blank_secret(
+            "the coordinator token",
+            token.as_ref(),
+        )?);
+        Ok(self)
     }
 
     fn url(&self, path: &str) -> String {
@@ -100,8 +127,27 @@ impl HttpCoordinator {
         let deadline = Instant::now() + RETRY_BUDGET;
         let mut attempt = 0u32;
         loop {
-            match self.client.post(url.as_str()).json(body).send().await {
+            let mut request = self.client.post(url.as_str()).json(body);
+            if let Some(token) = &self.token {
+                request = request.bearer_auth(token);
+            }
+            match request.send().await {
                 Ok(resp) => {
+                    // A 401 is never transient, so it is not retried, and it gets a
+                    // message that names the fix rather than a bare status code.
+                    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                        return Err(transport(format!(
+                            "{path} → HTTP 401: the coordinator rejected this agent's \
+                             credentials. It requires the shared coordinator token \
+                             (FORGE_COORDINATOR_TOKEN for the forge-agent CLI), and this \
+                             agent sent {}.",
+                            if self.token.is_some() {
+                                "a token that does not match"
+                            } else {
+                                "none"
+                            }
+                        )));
+                    }
                     if !resp.status().is_success() {
                         return Err(transport(format!("{} → HTTP {}", path, resp.status())));
                     }
@@ -166,14 +212,53 @@ impl CoordinatorServer {
     }
 }
 
-/// Serve the coordinator side of the wire protocol over `bind` (e.g. `0.0.0.0:8080`
-/// or `127.0.0.1:0` for an ephemeral test port), backed by `queue` + `store`.
-/// `threads` accept threads share the listener (the queue's atomic lease keeps
-/// concurrent pulls disjoint). `default_lease` caps how long a lease is granted when
-/// the pull doesn't ask for more.
+/// How [`serve_coordinator_with`] runs a coordinator.
+#[derive(Clone)]
+pub struct CoordinatorConfig {
+    /// How long a lease is granted when the pull doesn't ask for a specific TTL.
+    pub default_lease: Duration,
+    /// Accept threads sharing the listener (the queue's atomic lease keeps concurrent
+    /// pulls disjoint).
+    pub threads: usize,
+    /// Shared bearer token. `Some` → every route requires `Authorization: Bearer
+    /// <token>`; `None` → open, for a coordinator reachable only from inside its own
+    /// trust boundary.
+    pub token: Option<String>,
+}
+
+impl CoordinatorConfig {
+    /// An open coordinator with the given lease default and accept threads.
+    pub fn new(default_lease: Duration, threads: usize) -> Self {
+        Self {
+            default_lease,
+            threads,
+            token: None,
+        }
+    }
+
+    /// Require `token` on every route.
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+}
+
+// Hand-written so that logging a config can never print the token.
+impl std::fmt::Debug for CoordinatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoordinatorConfig")
+            .field("default_lease", &self.default_lease)
+            .field("threads", &self.threads)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Serve the coordinator side of the wire protocol over `bind`, **open** (no token).
 ///
-/// Must be called from within a Tokio runtime — the blocking accept threads bridge
-/// into the async `Queue`/`ResultStore` via [`tokio::runtime::Handle::block_on`].
+/// Equivalent to [`serve_coordinator_with`] with [`CoordinatorConfig::new`]. Only
+/// appropriate when the bind is reachable solely from your own workers' network; use
+/// [`serve_coordinator_with`] and a token for anything else.
 pub fn serve_coordinator<Q, S>(
     bind: &str,
     queue: Arc<Q>,
@@ -185,6 +270,40 @@ where
     Q: Queue + Send + Sync + 'static,
     S: ResultStore + Send + Sync + 'static,
 {
+    serve_coordinator_with(
+        bind,
+        queue,
+        store,
+        CoordinatorConfig::new(default_lease, threads),
+    )
+}
+
+/// Serve the coordinator side of the wire protocol over `bind` (e.g. `0.0.0.0:8080`
+/// or `127.0.0.1:0` for an ephemeral test port), backed by `queue` + `store`.
+///
+/// With a [`CoordinatorConfig::token`], a request without the matching bearer token is
+/// answered `401` before its body is read. A blank token is refused here rather than
+/// served, because it would accept `Bearer ` with nothing after it.
+///
+/// Must be called from within a Tokio runtime — the blocking accept threads bridge
+/// into the async `Queue`/`ResultStore` via [`tokio::runtime::Handle::block_on`].
+pub fn serve_coordinator_with<Q, S>(
+    bind: &str,
+    queue: Arc<Q>,
+    store: Arc<S>,
+    cfg: CoordinatorConfig,
+) -> Result<CoordinatorServer, ForgeError>
+where
+    Q: Queue + Send + Sync + 'static,
+    S: ResultStore + Send + Sync + 'static,
+{
+    let token: Option<Arc<str>> = cfg
+        .token
+        .as_deref()
+        .map(|t| forge_core::auth::non_blank_secret("the coordinator token", t))
+        .transpose()?
+        .map(Arc::from);
+    let default_lease = cfg.default_lease;
     let server = Arc::new(tiny_http::Server::http(bind).map_err(transport)?);
     let addr = server
         .server_addr()
@@ -194,18 +313,19 @@ where
     let handle = tokio::runtime::Handle::current();
 
     let mut handles = Vec::new();
-    for _ in 0..threads.max(1) {
+    for _ in 0..cfg.threads.max(1) {
         let server = Arc::clone(&server);
         let stop = Arc::clone(&stop);
         let queue = Arc::clone(&queue);
         let store = Arc::clone(&store);
+        let token = token.clone();
         let rt = handle.clone();
         handles.push(std::thread::spawn(move || {
             // Poll with a timeout so the `stop` flag is observed promptly.
             while !stop.load(Ordering::SeqCst) {
                 match server.recv_timeout(Duration::from_millis(200)) {
                     Ok(Some(req)) => {
-                        handle_request(&rt, req, &queue, &store, default_lease);
+                        handle_request(&rt, req, &queue, &store, default_lease, token.as_deref());
                     }
                     Ok(None) => continue, // idle timeout — re-check `stop`
                     Err(_) => break,
@@ -227,17 +347,53 @@ fn handle_request<Q, S>(
     queue: &Arc<Q>,
     store: &Arc<S>,
     default_lease: Duration,
+    token: Option<&str>,
 ) where
     Q: Queue + Send + Sync + 'static,
     S: ResultStore + Send + Sync + 'static,
 {
+    // Authenticate before touching the body, so an unauthenticated caller never gets
+    // a body buffered or parsed, let alone reaching the queue. The body stays unread on
+    // the wire, and the patched HTTP layer closes the connection after the 401 instead
+    // of draining it. Every failure is the same 401: missing, wrong scheme and wrong
+    // token are indistinguishable from outside.
+    if let Some(expected) = token {
+        let auth = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str().to_string());
+        if !forge_core::auth::bearer_matches(auth.as_deref(), expected) {
+            let challenge = tiny_http::Header::from_bytes(&b"WWW-Authenticate"[..], &b"Bearer"[..])
+                .expect("static header");
+            let _ = req.respond(text_status(401, "unauthorized").with_header(challenge));
+            return;
+        }
+    }
+
     let method = req.method().clone();
     let path = req.url().to_string();
-    let mut body = String::new();
-    if req.as_reader().read_to_string(&mut body).is_err() {
+    let mut raw = Vec::new();
+    if req
+        .as_reader()
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_end(&mut raw)
+        .is_err()
+    {
         let _ = req.respond(text_status(400, "unreadable body"));
         return;
     }
+    if raw.len() as u64 > MAX_BODY_BYTES {
+        let _ = req.respond(text_status(413, "request body exceeds the size limit"));
+        return;
+    }
+    let body = match String::from_utf8(raw) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = req.respond(text_status(400, "request body is not UTF-8"));
+            return;
+        }
+    };
 
     let outcome = route(rt, &method, &path, &body, queue, store, default_lease);
     let response = match outcome {
@@ -433,6 +589,23 @@ mod tests {
         Q: Queue + Send + Sync + 'static,
         S: ResultStore + Send + Sync + 'static,
     {
+        serve_with_on_dedicated_runtime(
+            queue,
+            store,
+            CoordinatorConfig::new(Duration::from_secs(30), threads),
+        )
+    }
+
+    /// [`serve_on_dedicated_runtime`] with a full [`CoordinatorConfig`] (e.g. a token).
+    fn serve_with_on_dedicated_runtime<Q, S>(
+        queue: Arc<Q>,
+        store: Arc<S>,
+        cfg: CoordinatorConfig,
+    ) -> (tokio::runtime::Runtime, CoordinatorServer)
+    where
+        Q: Queue + Send + Sync + 'static,
+        S: ResultStore + Send + Sync + 'static,
+    {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -440,14 +613,7 @@ mod tests {
             .expect("server runtime");
         let server = {
             let _enter = rt.enter(); // so serve_coordinator captures THIS runtime's handle
-            serve_coordinator(
-                "127.0.0.1:0",
-                queue,
-                store,
-                Duration::from_secs(30),
-                threads,
-            )
-            .expect("serve")
+            serve_coordinator_with("127.0.0.1:0", queue, store, cfg).expect("serve")
         };
         (rt, server)
     }
@@ -608,5 +774,127 @@ mod tests {
         assert_eq!(counts.done, 0);
         assert_eq!(counts.pending, 1);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[tokio::test]
+    async fn a_tokened_coordinator_serves_only_agents_that_hold_the_token() {
+        let _serial = SOCKET_TEST.lock().await;
+
+        let queue = Arc::new(SqliteQueue::open_in_memory().expect("queue"));
+        let items: Vec<Item> = (0..6).map(|i| item(&format!("t{i}"))).collect();
+        queue.enqueue(&items).await.expect("hydrate");
+        let out = tmp("token");
+        let _ = std::fs::remove_file(&out);
+        let store = Arc::new(JsonlStore::new(&out));
+        let (server_rt, server) = serve_with_on_dedicated_runtime(
+            Arc::clone(&queue),
+            Arc::clone(&store),
+            CoordinatorConfig::new(Duration::from_secs(30), 2).token("s3cret"),
+        );
+
+        let pull = LeasePull {
+            worker_id: "intruder".into(),
+            max: 6,
+            lease_secs: 30,
+        };
+
+        // No token: refused with a message that names the fix, and nothing leased.
+        let bare = HttpCoordinator::new(server.base_url()).expect("client");
+        let err = bare
+            .pull(&pull)
+            .await
+            .expect_err("no token must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "{msg}");
+        assert!(msg.contains("FORGE_COORDINATOR_TOKEN"), "{msg}");
+        assert!(msg.contains("sent none"), "{msg}");
+
+        // Wrong token: refused, and told the token it sent does not match.
+        let wrong = HttpCoordinator::new(server.base_url())
+            .expect("client")
+            .with_token("guess")
+            .expect("token");
+        let msg = wrong
+            .pull(&pull)
+            .await
+            .expect_err("wrong token")
+            .to_string();
+        assert!(msg.contains("does not match"), "{msg}");
+
+        // A forged result post without the token never reaches the store or the queue.
+        let forged = ResultPost {
+            custom_id: "t0".into(),
+            lease_generation: 1,
+            worker_id: "intruder".into(),
+            outcome: WireOutcome::Done {
+                status_code: 200,
+                response: serde_json::json!({"forged": true}),
+                usage: Default::default(),
+                latency_ms: 1,
+            },
+        };
+        assert!(bare.post(&forged).await.is_err());
+        let c = queue.counts().await.expect("counts");
+        assert_eq!(
+            (c.pending, c.leased, c.done),
+            (6, 0, 0),
+            "refused calls changed nothing"
+        );
+
+        // The right token drains the queue end to end.
+        let coord = HttpCoordinator::new(server.base_url())
+            .expect("client")
+            .with_token("s3cret")
+            .expect("token");
+        let worker = EchoWorker::new();
+        let drain = Drain::new();
+        let cfg = AgentConfig {
+            worker_id: "gpu1".into(),
+            max_lease: 3,
+            lease_secs: 30,
+            poll_idle: Duration::from_millis(5),
+            max_idle_polls: 2,
+        };
+        let stats = run_agent(&cfg, &coord, &worker, &drain).await.expect("run");
+        server.shutdown();
+        server_rt.shutdown_background();
+
+        assert_eq!(stats.processed, 6);
+        assert_eq!(queue.counts().await.expect("counts").done, 6);
+        let written = std::fs::read_to_string(&out).expect("results");
+        assert!(
+            !written.contains("forged"),
+            "the forged post was never stored"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[tokio::test]
+    async fn a_blank_token_is_refused_rather_than_served_open() {
+        let queue = Arc::new(SqliteQueue::open_in_memory().expect("queue"));
+        let store = Arc::new(JsonlStore::new(tmp("blank")));
+        let err = serve_coordinator_with(
+            "127.0.0.1:0",
+            queue,
+            store,
+            CoordinatorConfig::new(Duration::from_secs(30), 1).token(" \n"),
+        )
+        .err()
+        .expect("a blank token must not start an effectively-open server");
+        assert!(err.to_string().contains("empty"), "{err}");
+
+        // The client refuses to send one too.
+        assert!(HttpCoordinator::new("http://127.0.0.1:1")
+            .expect("client")
+            .with_token("")
+            .is_err());
+    }
+
+    #[test]
+    fn a_config_never_prints_its_token() {
+        let cfg = CoordinatorConfig::new(Duration::from_secs(1), 1).token("s3cret");
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
     }
 }

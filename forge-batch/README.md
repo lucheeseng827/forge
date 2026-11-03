@@ -35,14 +35,17 @@ independent items.
 
 | method | path | purpose | auth |
 |---|---|---|---|
-| `GET`  | `/v1/health` | liveness + batch count | none |
+| `GET`  | `/v1/health` | liveness + build identity + uptime | none |
 | `POST` | `/v1/files` | upload a batch input JSONL → File object | bearer |
+| `GET`  | `/v1/files` | list File objects (`?purpose=`), newest first, paged (`?after=`, `?limit=`, `has_more`) | bearer |
 | `GET`  | `/v1/files/{id}` | retrieve a File object | bearer |
 | `GET`  | `/v1/files/{id}/content` | stream file bytes (outputs reshaped) | bearer |
+| `DELETE` | `/v1/files/{id}` | delete record + bytes (409 while an in-progress batch's input) | bearer |
 | `POST` | `/v1/batches` | create + start a batch | bearer |
-| `GET`  | `/v1/batches` | list all batches | bearer |
+| `GET`  | `/v1/batches` | list batches, newest first, paged like files | bearer |
 | `GET`  | `/v1/batches/{id}` | retrieve a batch (status from queue counts) | bearer |
-| `POST` | `/v1/batches/{id}/cancel` | cancel a batch | bearer |
+| `POST` | `/v1/batches/{id}/cancel` | cancel a batch (`cancelling`, then `cancelled` once its run has stopped) | bearer |
+| `GET`  | `/v1/batches/{id}/results` | **forge extension:** results written so far, mid-run (`?kind=`, `?after=` cursor) | bearer |
 
 ## Quickstart
 

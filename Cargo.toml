@@ -12,13 +12,16 @@ members = [
     "forge-agent",
     "forge-batch",
 ]
+# The vendored, patched tiny_http (see `[patch.crates-io]` below) is a dependency, not a
+# member: excluded so `--workspace` lints and tests forge's crates, not upstream's.
+exclude = ["vendor/tiny_http"]
 
 # forge is its OWN standalone workspace with its own Cargo.lock — the member list
 # below is the complete, closed set of crates it ships. Build it standalone:
 # `cargo check --workspace`.
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/forge"
@@ -43,7 +46,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
-clap = { version = "4", features = ["derive"] }
+# `env`: a secret can come from the environment instead of argv (where it would sit in
+# /proc/<pid>/cmdline). It enables code inside clap_builder; no new crate.
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
@@ -79,6 +84,15 @@ bytes = "1"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "54"
 arrow-schema = "54"
+
+# tiny_http is the HTTP server under serve-batch and the coordinator wire, and 0.12.0
+# (its latest release) can be crashed or desynchronised by one hostile request: it
+# discarded an unread body with an allocation the size of the declared Content-Length,
+# and parsed an unread chunked body as the next request. The vendored copy fixes both
+# and bounds header lines. Every change is listed in vendor/tiny_http/FORGE_PATCHES.md;
+# the ee workspace carries the same patch.
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
 
 # Single small static binary. panic=abort is safe here because this
 # is a leaf workspace; the test profile still unwinds.

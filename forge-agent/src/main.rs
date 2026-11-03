@@ -13,17 +13,25 @@
 //!   against a local engine (`--engine`), and (with `--cloud`) drain on a spot notice.
 //! - `serve` — the coordinator side: expose a local queue + result store over the
 //!   `forge-proto` HTTP protocol for agents to lease from and post back to.
+//!
+//! `serve` and `run` share one secret, `FORGE_COORDINATOR_TOKEN`, read from the
+//! environment only so it never appears in a process listing. `serve` requires it for
+//! any bind that is reachable from another machine.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use forge_agent::http::{serve_coordinator, HttpCoordinator};
+use forge_agent::http::{serve_coordinator_with, CoordinatorConfig, HttpCoordinator};
 use forge_agent::{run_agent, AgentConfig, CloudSource, Drain, InProcessCoordinator};
 use forge_core::{EndpointKind, Worker, WorkerSpec};
 use forge_queue::SqliteQueue;
 use forge_store::JsonlStore;
 use forge_worker::HttpWorker;
+
+/// The shared coordinator secret. Environment-only: a flag value would land in
+/// `/proc/<pid>/cmdline` and in every process listing on the box.
+const TOKEN_ENV: &str = "FORGE_COORDINATOR_TOKEN";
 
 #[derive(Parser)]
 #[command(
@@ -96,10 +104,10 @@ enum Cmd {
         /// Path to the result JSONL the coordinator writes (store-then-ack).
         #[arg(long)]
         out: String,
-        /// Bind address. Defaults to **loopback** — the coordinator serves
-        /// unauthenticated lease/result/interruption posts, so a public bind
-        /// (`0.0.0.0:…`) would let any reachable host pull prompts or forge results.
-        /// Only widen it behind your own network controls (VPC / firewall / proxy).
+        /// Bind address. Defaults to **loopback**. Any other bind (`0.0.0.0:…`, a
+        /// routable address) requires `FORGE_COORDINATOR_TOKEN`: the coordinator hands
+        /// out raw prompts and accepts the results that become the record, so an open
+        /// one lets any reachable host read prompts or forge results.
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
         /// Default lease visibility timeout, seconds (when a pull doesn't ask).
@@ -108,6 +116,12 @@ enum Cmd {
         /// Accept threads.
         #[arg(long, default_value_t = 4)]
         threads: usize,
+        /// Serve a non-loopback bind with NO token. Only for a network where every
+        /// host that can reach the port is already trusted with every prompt and
+        /// result (an isolated VPC, a pod reachable only through a mesh that
+        /// authenticates). Ignored when FORGE_COORDINATOR_TOKEN is set.
+        #[arg(long)]
+        insecure_no_auth: bool,
     },
 }
 
@@ -120,6 +134,39 @@ fn endpoint_kind(s: &str) -> anyhow::Result<EndpointKind> {
             "unknown endpoint {other:?} (chat|completions|embeddings)"
         )),
     }
+}
+
+/// Refuse to serve an open coordinator on a bind other machines can reach.
+///
+/// The default bind is loopback, so this only fires for someone who widened it — which
+/// is exactly the moment to ask for a token, rather than discovering later that every
+/// prompt in the queue was readable from the subnet.
+fn check_exposure(bind: &str, has_token: bool, insecure_no_auth: bool) -> anyhow::Result<()> {
+    if has_token {
+        if insecure_no_auth {
+            tracing::warn!(
+                "--insecure-no-auth is ignored: {TOKEN_ENV} is set, so the coordinator requires it"
+            );
+        }
+        return Ok(());
+    }
+    if forge_core::auth::is_loopback_bind(bind) {
+        return Ok(());
+    }
+    if insecure_no_auth {
+        tracing::warn!(
+            bind,
+            "serving the coordinator with NO authentication on a non-loopback bind \
+             (--insecure-no-auth): any host that can reach it can lease prompts and post results"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to serve the coordinator on {bind} without a token: any host that can reach \
+         it could lease prompts and post forged results. Set {TOKEN_ENV} here and on every \
+         `forge-agent run`, bind to loopback, or pass --insecure-no-auth if every host that \
+         can reach this port is already trusted."
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -187,7 +234,14 @@ async fn run() -> anyhow::Result<()> {
         } => {
             // `concurrency` is already range-validated to ≥ 1 by clap.
             let kind = endpoint_kind(&endpoint)?;
-            let coord = HttpCoordinator::new(&coordinator)?;
+            let mut coord = HttpCoordinator::new(&coordinator)?;
+            let authenticated = match forge_core::auth::secret_from_env(TOKEN_ENV)? {
+                Some(token) => {
+                    coord = coord.with_token(token)?;
+                    true
+                }
+                None => false,
+            };
             let worker = HttpWorker::new(
                 WorkerSpec::new(&worker_id, &engine, kind).concurrency(concurrency as usize),
             )?;
@@ -215,6 +269,7 @@ async fn run() -> anyhow::Result<()> {
                 worker_id = %worker_id,
                 concurrency,
                 cloud = %cloud,
+                authenticated,
                 "forge-agent running (lease-proxy + optional in-VM drain)"
             );
 
@@ -252,20 +307,26 @@ async fn run() -> anyhow::Result<()> {
             bind,
             lease_secs,
             threads,
+            insecure_no_auth,
         } => {
+            // Decide on auth BEFORE opening anything: a refusal must not leave a
+            // half-created queue file behind.
+            let token = forge_core::auth::secret_from_env(TOKEN_ENV)?;
+            check_exposure(&bind, token.is_some(), insecure_no_auth)?;
+
             let q = Arc::new(SqliteQueue::open(&queue)?);
             let s = Arc::new(JsonlStore::new(&out));
-            let server = serve_coordinator(
-                &bind,
-                Arc::clone(&q),
-                Arc::clone(&s),
-                Duration::from_secs(lease_secs),
-                threads,
-            )?;
+            let mut cfg = CoordinatorConfig::new(Duration::from_secs(lease_secs), threads);
+            let authenticated = token.is_some();
+            if let Some(token) = token {
+                cfg = cfg.token(token);
+            }
+            let server = serve_coordinator_with(&bind, Arc::clone(&q), Arc::clone(&s), cfg)?;
             tracing::info!(
                 addr = %server.addr(),
                 queue = %queue,
                 out = %out,
+                authenticated,
                 "forge-coordinator serving forge-proto (agent leases here; single-writer)"
             );
             // Serve until the process is killed; `server`'s threads run independently.
